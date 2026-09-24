@@ -1,6 +1,14 @@
+mod adx;
 pub mod catalog;
 pub mod config;
 pub mod crypto;
+mod diagnostics;
+mod embedded;
+pub mod local;
 pub mod service;
 mod shared;
+mod task_runner;
+pub mod tree;
+pub mod upload;
+pub mod usm;
 pub mod worker;

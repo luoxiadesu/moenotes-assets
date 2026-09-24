@@ -11,24 +11,40 @@ Active export and download registries hold weak entries. Reference-counted lease
 keep payloads alive while consumers need them, then remove temporary directories.
 One caller's cancellation does not cancel another caller's lease. Resource gates
 serialize cancellation/retry overlap around publication. Queue, download, worker,
-video and temporary-storage budgets are distinct.
+video and temporary-storage budgets are distinct. A bounded JoinSet runs resources
+independently of task checkpoint writes, so a coordinator waiting for SQL never
+suspends the resource futures that need to release pooled SQL connections. The
+SQLite pool stays at four connections. Selections are persisted before execution;
+failed checkpoints and cancellation account for every selected key.
 
 Downloads disable redirects and environment proxy inheritance, remain under the
 configured CDN root, enforce declared size, and decrypt the bundle prefix while
 streaming. A worker checks UnityFS block CRC when nonzero. CRI's catalog CRC=0 is
-not claimed as a successful checksum comparison. Local embedded dependencies
-without a remote address fail explicitly.
+not claimed as a successful checksum comparison. Local embedded dependencies require an explicit immutable, hash-pinned directory
+source. Full length/SHA256 verification precedes decryption and CRC checking.
+Preflight reports availability and capability before attempting an export.
 
 CRI logical assets with exactly one raw-media dependency can bypass playback-only
 ScriptableObject/MonoScript dependencies. The selected raw container is still
-validated; ambiguous multi-media wrappers are refused. Embedded waveform references
-are decoded, not arbitrary paths inferred from a filename.
+validated; ambiguous multi-media wrappers are refused. Self-contained serialized
+CRI wrappers select bytes through implementation.rid and an exact implementation
+type, without loading playback-only MonoScript dependencies. Embedded waveform
+references are decoded, not arbitrary paths inferred from a filename.
 
 Workers run the same executable in a separate process under Linux `prlimit`.
 Unity uses bounded file/memory Regions; CRI may materialize waveforms and therefore
 also relies on process limits. FFmpeg/ffprobe execute through a small Rust exec
 wrapper that sets parent-death signaling. Cancellation kills the worker process
-group, and container init handles orphan reaping. These are resource controls,
+group, and container init handles orphan reaping. stdout/stderr are drained concurrently:
+stderr retains a 16 KiB tail and probe stdout a 1 MiB prefix (oversize output
+fails). Failures save mode-0600 private diagnostic JSON under a mode-0700 directory;
+the API receives only fixed error codes, process metadata and opaque IDs. Tool
+versions are recorded at startup; media diagnostics link to export/snapshot/key
+and raw input SHA256 through a private worker context. Parent-side launch/signal
+failures may lack that media context. Resource completion logs include export ID,
+elapsed time and success; existing manifests retain artifact size/SHA validation.
+Diagnostics have no automatic retention policy; include this directory in the
+service-volume quota and operator log-retention process. These are resource controls,
 not a hardened hostile-code sandbox. Add container memory, disk and network policy
 for deployment.
 
@@ -46,5 +62,8 @@ content without an independent trusted expected digest.
 
 Known alpha boundaries: Android binary v2 catalog only; no login or CDN discovery;
 no byte-range download resume, automatic retries, multi-instance coordination,
-object storage, browser UI, authentication, export garbage collector, external
-AWB discovery, cue runtime, alpha video, or arbitrary Unity object export.
+browser UI, authentication, export garbage collector, external AWB discovery,
+cue runtime or arbitrary Unity object conversion. Explicit CLI export-tree and
+conditional S3 upload are separate from the HTTP service and its local store.
+USM timing, alpha and strict ADX contracts are described in MEDIA.md; naming and
+immutable migration rules are described in EXPORT.md.

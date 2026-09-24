@@ -174,6 +174,9 @@ async fn http_pipeline_dedupe_cancel_recovery_and_range() {
         let t = task(&client, &base, slow["id"].as_str().unwrap()).await;
         assert_eq!(t["state"], "failed");
         assert!(t["error"].as_str().unwrap().contains("interrupted"));
+        assert_eq!(t["completed"], t["total"]);
+        assert_eq!(t["results"].as_array().unwrap().len(), 1);
+        assert_eq!(t["results"][0]["key"], KEY);
     }
     mode.store(2, Ordering::SeqCst);
     let bad = post(&client, format!("{base}/v1/exports"), json!({"keys":[KEY]})).await;
@@ -295,6 +298,36 @@ async fn http_pipeline_dedupe_cancel_recovery_and_range() {
         "succeeded"
     );
     assert_eq!(count.load(Ordering::SeqCst), previous + 1);
+    let preflight: Value = client
+        .post(format!("{base}/v1/preflight"))
+        .json(&json!({"keys":[KEY,"missing"]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(preflight["results"][0]["status"], "remote");
+    assert_eq!(preflight["results"][1]["status"], "missing");
+    let tree_root = dir.path().join("tree");
+    let index = moenotes_assets::tree::export(&dir.path().join("data"), &tree_root, None, false)
+        .await
+        .unwrap();
+    assert_eq!(index.objects.len(), 1);
+    assert!(index.objects[0].object_key.starts_with(KEY));
+    assert!(!tree_root.join(&index.objects[0].object_key).is_symlink());
+    let repeated = moenotes_assets::tree::export(&dir.path().join("data"), &tree_root, None, false)
+        .await
+        .unwrap();
+    assert_eq!(index.objects, repeated.objects);
+    let public = std::fs::read_to_string(tree_root.join("_meta/manifest.json")).unwrap();
+    assert!(!public.contains(&dir.path().display().to_string()));
+    std::fs::write(tree_root.join(&index.objects[0].object_key), b"conflict").unwrap();
+    assert!(
+        moenotes_assets::tree::export(&dir.path().join("data"), &tree_root, None, false)
+            .await
+            .is_err()
+    );
     let file_path = dir
         .path()
         .join("data/exports")

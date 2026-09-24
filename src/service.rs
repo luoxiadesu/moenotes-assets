@@ -1,8 +1,9 @@
 use crate::{
-    catalog::{CRYPT, Catalog, Location},
+    catalog::{CRYPT, Catalog, Location, Selector},
     config::Config,
-    crypto,
+    crypto, diagnostics,
     shared::{self, Registry},
+    task_runner,
     worker::{self, Artifact, Input, Job},
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -27,7 +28,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     io::AsyncWriteExt,
@@ -64,6 +65,12 @@ pub struct Manifest {
     pub profile: String,
     pub files: Vec<PublishedFile>,
     pub sources: Vec<Value>,
+    #[serde(default)]
+    pub selected_location: Option<u32>,
+    #[serde(default)]
+    pub empty: bool,
+    #[serde(default)]
+    pub options: Value,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ItemResult {
@@ -77,6 +84,9 @@ pub struct Task {
     pub kind: String,
     pub state: String,
     pub snapshot: Option<String>,
+    /// Original selection, retained so interrupted tasks can account for every key.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keys: Vec<String>,
     pub total: usize,
     pub completed: usize,
     pub results: Vec<ItemResult>,
@@ -91,6 +101,10 @@ pub struct ExportRequest {
     #[serde(default)]
     pub keys: Vec<String>,
     pub prefix: Option<String>,
+    #[serde(default)]
+    pub selector: Selector,
+    #[serde(default)]
+    pub archive: bool,
 }
 #[derive(Default, Deserialize)]
 pub struct ListQuery {
@@ -101,7 +115,7 @@ pub struct ListQuery {
     pub limit: Option<usize>,
 }
 
-fn now() -> u64 {
+pub(crate) fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -110,8 +124,29 @@ fn now() -> u64 {
 fn id() -> String {
     Uuid::new_v4().to_string()
 }
-fn export_id(snapshot: &str, key: &str) -> String {
-    crypto::digest(&serde_json::to_vec(&(snapshot, key, worker::PROFILE)).unwrap())
+fn export_id(
+    snapshot: &str,
+    key: &str,
+    config: &Config,
+    selector: &Selector,
+    archive: bool,
+    media_identity: &str,
+) -> String {
+    crypto::digest(
+        &serde_json::to_vec(&(
+            snapshot,
+            key,
+            worker::PROFILE,
+            media_identity,
+            selector,
+            archive,
+            config.decryption(key),
+            crypto::digest(&config.cri_key.to_le_bytes()),
+            config.ffmpeg_threads,
+            config.local_source.as_ref().map(|s| s.identity()),
+        ))
+        .unwrap(),
+    )
 }
 fn valid_id(s: &str) -> bool {
     !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
@@ -176,8 +211,10 @@ pub struct App {
     resource_locks: Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     catalog_cache: tokio::sync::Mutex<HashMap<String, (Snapshot, Arc<Catalog>)>>,
     cancellations: Mutex<HashMap<String, CancellationToken>>,
+    unpersisted_tasks: Mutex<HashMap<String, Task>>,
     budget: Arc<Budget>,
     shutdown: CancellationToken,
+    media_identity: std::sync::OnceLock<String>,
     _lock: std::fs::File,
 }
 
@@ -235,6 +272,15 @@ impl App {
                 if matches!(t.state.as_str(), "queued" | "running") {
                     t.state = "failed".into();
                     t.error = Some("interrupted by service restart; resubmit failed keys".into());
+                    let reported: std::collections::HashSet<_> =
+                        t.results.iter().map(|r| r.key.clone()).collect();
+                    t.results
+                        .extend(t.keys.iter().filter(|k| !reported.contains(*k)).map(|k| {
+                            task_runner::failed_item(k.clone(), "interrupted by service restart")
+                        }));
+                    if t.kind == "export" {
+                        t.completed = t.results.len();
+                    }
                     t.updated = now();
                     sqlx::query("UPDATE tasks SET body=? WHERE id=?")
                         .bind(serde_json::to_string(&t)?)
@@ -285,42 +331,56 @@ impl App {
             resource_locks: Mutex::new(HashMap::new()),
             catalog_cache: tokio::sync::Mutex::new(HashMap::new()),
             cancellations: Mutex::new(HashMap::new()),
+            unpersisted_tasks: Mutex::new(HashMap::new()),
             shutdown: CancellationToken::new(),
+            media_identity: std::sync::OnceLock::new(),
             _lock: lock,
         });
         app.media_ready().await?;
         Ok(app)
     }
     async fn media_ready(&self) -> Result<()> {
-        for bin in [&self.config.ffmpeg, &self.config.ffprobe] {
-            let status = tokio::time::timeout(
-                Duration::from_secs(10),
-                Command::new(bin)
-                    .arg("-version")
-                    .kill_on_drop(true)
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status(),
-            )
-            .await??;
-            ensure!(status.success(), "media tools unavailable");
+        let mut versions = serde_json::Map::new();
+        for (tool, binary) in [
+            ("ffmpeg", &self.config.ffmpeg),
+            ("ffprobe", &self.config.ffprobe),
+        ] {
+            let version =
+                diagnostics::inspect_tool(&self.config, binary, &["-version"], tool).await?;
+            versions.insert(
+                tool.into(),
+                json!(
+                    String::from_utf8_lossy(&version)
+                        .lines()
+                        .next()
+                        .unwrap_or("unknown")
+                        .chars()
+                        .take(1024)
+                        .collect::<String>()
+                ),
+            );
         }
-        let codecs = tokio::time::timeout(
-            Duration::from_secs(10),
-            Command::new(&self.config.ffmpeg)
-                .args(["-hide_banner", "-encoders"])
-                .kill_on_drop(true)
-                .output(),
+        self.media_identity
+            .set(crypto::digest(&serde_json::to_vec(&versions)?))
+            .map_err(|_| anyhow::anyhow!("media versions already initialized"))?;
+        diagnostics::save_versions(&self.config, &Value::Object(versions))?;
+        let codecs = diagnostics::inspect_tool(
+            &self.config,
+            &self.config.ffmpeg,
+            &["-hide_banner", "-encoders"],
+            "ffmpeg",
         )
-        .await??;
-        let list = String::from_utf8_lossy(&codecs.stdout);
+        .await?;
+        let list = String::from_utf8_lossy(&codecs);
         ensure!(
-            codecs.status.success()
-                && list.contains("libx264")
+            list.contains("libx264")
+                && list
+                    .lines()
+                    .any(|l| l.split_whitespace().nth(1) == Some("ffv1"))
                 && list
                     .lines()
                     .any(|l| l.split_whitespace().nth(1) == Some("aac")),
-            "FFmpeg AAC/libx264 required"
+            "FFmpeg AAC/libx264/FFV1 required"
         );
         Ok(())
     }
@@ -345,13 +405,32 @@ impl App {
         sqlx::query("INSERT INTO tasks(id,body) VALUES(?,?) ON CONFLICT(id) DO UPDATE SET body=excluded.body").bind(&t.id).bind(serde_json::to_string(t)?).execute(&self.db).await?;
         Ok(())
     }
+    async fn finish_task(&self, task: &mut Task) {
+        if let Err(error) = self.save_task(task).await {
+            tracing::error!(task=%task.id, %error, "task final persistence failed");
+            task_runner::persistence_failed(task);
+            // One bounded retry persists the failure itself when storage recovers.
+            if let Err(error) = self.save_task(task).await {
+                tracing::error!(task=%task.id, %error, "task failure retained in memory; storage repair required");
+                self.unpersisted_tasks
+                    .lock()
+                    .unwrap()
+                    .insert(task.id.clone(), task.clone());
+            }
+        }
+    }
     async fn new_task(
         &self,
         kind: &str,
         snapshot: Option<String>,
         total: usize,
+        keys: Vec<String>,
     ) -> Result<(Task, CancellationToken, OwnedSemaphorePermit)> {
         ensure!(!self.shutdown.is_cancelled(), "service shutting down");
+        ensure!(
+            self.unpersisted_tasks.lock().unwrap().is_empty(),
+            "task persistence unavailable; restart after repairing storage"
+        );
         let permit = self
             .queue
             .clone()
@@ -363,6 +442,7 @@ impl App {
             state: "queued".into(),
             snapshot,
             total,
+            keys,
             completed: 0,
             results: vec![],
             error: None,
@@ -442,13 +522,19 @@ impl App {
         Ok(bytes)
     }
     pub async fn submit_refresh(self: &Arc<Self>) -> Result<Task> {
-        let (mut task, token, permit) = self.new_task("catalog_refresh", None, 1).await?;
+        let (mut task, token, permit) = self.new_task("catalog_refresh", None, 1, vec![]).await?;
         let answer = task.clone();
         let app = self.clone();
         tokio::spawn(async move {
             let _permit = permit;
             task.state = "running".into();
-            let _ = app.save_task(&task).await;
+            if let Err(error) = app.save_task(&task).await {
+                tracing::error!(task=%task.id, %error, "task start persistence failed");
+                task_runner::persistence_failed(&mut task);
+                app.finish_task(&mut task).await;
+                app.cancellations.lock().unwrap().remove(&task.id);
+                return;
+            }
             let result = app.refresh(&token).await;
             match result {
                 Ok(s) => {
@@ -467,7 +553,7 @@ impl App {
                 }
             }
             task.updated = now();
-            let _ = app.save_task(&task).await;
+            app.finish_task(&mut task).await;
             app.cancellations.lock().unwrap().remove(&task.id);
         });
         Ok(answer)
@@ -553,75 +639,65 @@ impl App {
             "empty or excessive selection"
         );
         ensure!(keys.iter().all(|k| k.len() <= 4096), "key limit");
+        let selector = request.selector;
+        ensure!(
+            selector.location_id.is_none() || keys.len() == 1,
+            "location_id requires exactly one key"
+        );
+        let archive = request.archive;
         let (mut task, token, permit) = self
-            .new_task("export", Some(snapshot.id.clone()), keys.len())
+            .new_task(
+                "export",
+                Some(snapshot.id.clone()),
+                keys.len(),
+                keys.clone(),
+            )
             .await?;
         let answer = task.clone();
         let app = self.clone();
         tokio::spawn(async move {
             let _permit = permit;
             task.state = "running".into();
-            let _ = app.save_task(&task).await;
-            let mut stream = futures_util::stream::iter(keys)
-                .map(|key| {
+            if let Err(error) = app.save_task(&task).await {
+                tracing::error!(task=%task.id, %error, "task start persistence failed");
+                task_runner::persistence_failed(&mut task);
+                token.cancel();
+            }
+            task_runner::run(
+                &mut task,
+                keys,
+                app.config.downloads,
+                &token,
+                |key| {
                     let app = app.clone();
                     let snapshot = snapshot.clone();
                     let catalog = catalog.clone();
                     let token = token.clone();
+                    let selector=selector.clone();
                     async move {
+                        let started = Instant::now();
+                        let eid = export_id(&snapshot.id, &key, &app.config, &selector, archive, app.media_identity.get().unwrap());
                         let result = app
-                            .export_shared(snapshot, catalog, key.clone(), &token)
+                            .export_shared(snapshot, catalog, key.clone(), selector, archive, &token)
                             .await;
+                        tracing::info!(export=%eid, elapsed_ms=started.elapsed().as_millis(), success=result.is_ok(), "resource finished");
                         match result {
                             Ok(m) => ItemResult {
                                 key,
-                                export_id: Some(m.id.clone()),
+                                export_id: Some(m.id),
                                 error: None,
                             },
-                            Err(e) => ItemResult {
-                                key,
-                                export_id: None,
-                                error: Some(e.to_string()),
-                            },
+                            Err(e) => task_runner::failed_item(key, &e.to_string()),
                         }
                     }
-                })
-                .buffer_unordered(app.config.downloads);
-            while let Some(result) = stream.next().await {
-                task.completed += 1;
-                task.results.push(result);
-                task.updated = now();
-                if let Err(e) = if task.completed.is_multiple_of(20) || task.completed == task.total
-                {
-                    app.save_task(&task).await
-                } else {
-                    Ok(())
-                } {
-                    tracing::error!(task=%task.id,error=%e,"task persistence failed");
-                    token.cancel();
-                }
-                if token.is_cancelled() {
-                    break;
-                }
-            }
-            drop(stream);
-            let successes = task
-                .results
-                .iter()
-                .filter(|r| r.export_id.is_some())
-                .count();
-            task.state = if token.is_cancelled() {
-                "cancelled"
-            } else if successes == task.total {
-                "succeeded"
-            } else if successes > 0 {
-                "partial"
-            } else {
-                "failed"
-            }
-            .into();
-            task.updated = now();
-            let _ = app.save_task(&task).await;
+                },
+                |task| {
+                    let app = app.clone();
+                    async move { app.save_task(&task).await }
+                },
+            )
+            .await;
+            app.finish_task(&mut task).await;
             app.cancellations.lock().unwrap().remove(&task.id);
         });
         Ok(answer)
@@ -631,9 +707,18 @@ impl App {
         snapshot: Snapshot,
         catalog: Arc<Catalog>,
         key: String,
+        selector: Selector,
+        archive: bool,
         token: &CancellationToken,
     ) -> Result<Manifest> {
-        let eid = export_id(&snapshot.id, &key);
+        let eid = export_id(
+            &snapshot.id,
+            &key,
+            &self.config,
+            &selector,
+            archive,
+            self.media_identity.get().unwrap(),
+        );
         if let Some(m) = self.manifest(&eid).await? {
             return Ok(m);
         }
@@ -642,7 +727,10 @@ impl App {
             &self.export_registry,
             eid.clone(),
             token,
-            move |cancel| async move { app.export_one(snapshot, catalog, key, eid, cancel).await },
+            move |cancel| async move {
+                app.export_one(snapshot, catalog, key, (selector, archive), eid, cancel)
+                    .await
+            },
         )
         .await?;
         Ok((*result).clone())
@@ -660,6 +748,20 @@ impl App {
             let opts=location.options.as_ref().context("missing bundle options")?;ensure!(opts.size>0&&opts.size<=app.config.input_bytes,"input size budget");
             let reservation=app.budget.reserve(opts.size)?;ensure!(fs2::available_space(&app.config.data_dir)?>opts.size,"insufficient free disk space");let dir=tempfile::Builder::new().prefix("download-").tempdir_in(app.config.data_dir.join("tmp"))?;
             let name=location.internal.rsplit('/').next().context("basename")?;ensure!(!name.is_empty(),"empty basename");let path=dir.path().join("payload");
+            if !location.internal.starts_with("http://") && !location.internal.starts_with("https://") {
+                let source=app.config.local_source.clone().context("local dependency requires configured source")?;
+                let internal=location.internal.clone();let target=path.clone();let limit=app.config.input_bytes;
+                let sha=tokio::task::spawn_blocking(move ||source.copy_verified(&internal,&target,limit)).await??;
+                ensure!(path.metadata()?.len()==opts.size,"local/catalog size mismatch");
+                if location.provider==CRYPT&&!crypto::builtin(name){
+                    use tokio::io::{AsyncReadExt,AsyncSeekExt};
+                    let mut file=tokio::fs::OpenOptions::new().read(true).write(true).open(&path).await?;
+                    let mut prefix=vec![0;opts.size.min(16384) as usize];file.read_exact(&mut prefix).await?;
+                    crypto::decrypt(&mut prefix,name,0)?;file.seek(std::io::SeekFrom::Start(0)).await?;file.write_all(&prefix).await?;file.sync_all().await?;
+                }
+                ensure!(!cancel.is_cancelled(),"cancelled");
+                return Ok(Download{input:Input{location,path},raw_sha256:sha,_dir:dir,_reservation:reservation});
+            }
             let config=Config{cdn_root:snapshot.cdn_root,..app.config.clone()};let url=config.asset_url(&location.internal)?;
             let response=tokio::select!{_ = cancel.cancelled()=>bail!("cancelled"),r=app.client.get(url).send()=>r?};ensure!(response.status()==StatusCode::OK,"CDN HTTP {}",response.status());ensure!(response.content_length().is_none_or(|n|n==opts.size),"Content-Length mismatch");
             use sha2::Digest;let mut hash=sha2::Sha256::new();let mut stream=response.bytes_stream();let mut f=tokio::fs::File::create(&path).await?;let mut received=0u64;
@@ -673,6 +775,7 @@ impl App {
         snapshot: Snapshot,
         catalog: Arc<Catalog>,
         key: String,
+        selection: (Selector, bool),
         eid: String,
         cancel: CancellationToken,
     ) -> Result<Manifest> {
@@ -691,15 +794,26 @@ impl App {
         if let Some(m) = self.manifest(&eid).await? {
             return Ok(m);
         }
-        let target = catalog.target(&key)?.clone();
-        let mut closure = catalog.closure(&key)?;
+        let (selector, archive) = selection;
+        let mut target = catalog.resolve(&key, &selector)?.clone();
+        target.key = key.clone();
+        let mut closure = catalog.closure_from(target.id)?;
         // Playback wrapper dependencies are not required for the unique raw CRI payload.
-        if target.resource_type.starts_with("CriWare.") {
+        if target.resource_type.starts_with("CriWare.") && !archive {
             closure.retain(|l| l.provider == crate::catalog::CRI);
-            ensure!(
-                closure.len() == 1,
-                "ambiguous or missing CRI media dependency"
-            );
+            ensure!(closure.len() <= 1, "ambiguous CRI media dependencies");
+            if closure.is_empty() {
+                closure = catalog.closure_from(target.id)?;
+                // Serialized embedded CRI implementations carry their bytes in
+                // the target bundle's type tree; MonoScript playback assemblies
+                // are not used to read that byte array.
+                closure.retain(|l| {
+                    !l.internal
+                        .rsplit('/')
+                        .next()
+                        .is_some_and(|n| n.to_ascii_lowercase().contains("monoscripts"))
+                });
+            }
         }
         ensure!(closure.len() <= 512, "dependency count limit");
         // Retain shared payload references until this resource finishes.
@@ -745,9 +859,11 @@ impl App {
             target,
             inputs: inputs.iter().map(|v| v.input.clone()).collect(),
             output: output.clone(),
+            archive,
         };
         tokio::fs::write(&job_path, serde_json::to_vec(&job)?).await?;
         let exe = std::env::current_exe()?;
+        let (cpu_seconds, wall_seconds) = self.config.worker_limits(video_input);
         let mut cmd = Command::new("prlimit");
         cmd.args([
             format!("--as={}", self.config.worker_memory_bytes),
@@ -755,27 +871,85 @@ impl App {
                 "--fsize={}",
                 self.config.output_bytes.max(self.config.expanded_bytes)
             ),
-            format!("--cpu={}", self.config.worker_timeout_secs),
+            format!("--cpu={}:{}", cpu_seconds, cpu_seconds.saturating_add(1)),
             "--nofile=256".into(),
             "--".into(),
         ])
         .arg(exe)
         .arg("worker")
         .arg(&job_path)
+        .env(
+            "MOENOTES_DIAGNOSTIC_CONTEXT",
+            serde_json::to_string(&json!({
+                "export_id":eid,"snapshot":snapshot.id,"key":key,
+                "input_sha256":inputs.iter().map(|i| &i.raw_sha256).collect::<Vec<_>>()
+            }))?,
+        )
         .kill_on_drop(true)
         .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
-        let mut child = cmd.spawn()?;
+        .stderr(Stdio::piped());
+        let started = Instant::now();
+        let mut child = cmd.spawn().map_err(|_| {
+            diagnostics::failure(
+                &self.config,
+                "worker_spawn_failed",
+                "worker",
+                "worker",
+                None,
+                started,
+                &Default::default(),
+            )
+        })?;
         let pid = child.id().context("worker PID")?;
-        let outcome = tokio::select! {_ = cancel.cancelled()=>Err(anyhow::anyhow!("cancelled")),r=tokio::time::timeout(Duration::from_secs(self.config.worker_timeout_secs),child.wait())=>match r{Ok(r)=>r.map_err(Into::into),Err(_)=>Err(anyhow::anyhow!("worker timeout"))}};
+        let stderr = child.stderr.take().context("worker stderr")?;
+        let drain = tokio::spawn(diagnostics::drain_stderr(stderr));
+        let outcome = tokio::select! {
+            _ = cancel.cancelled() => Err("worker_cancelled"),
+            r = tokio::time::timeout(Duration::from_secs(wall_seconds), child.wait()) => match r {
+                Ok(Ok(status)) => Ok(status), Ok(Err(_)) => Err("worker_wait_failed"), Err(_) => Err("worker_timeout"),
+            }
+        };
         let _ = nix::sys::signal::killpg(
             nix::unistd::Pid::from_raw(pid as i32),
             nix::sys::signal::Signal::SIGKILL,
         );
-        let _ = child.wait().await;
-        ensure!(outcome?.success(), "worker process failed");
+        let reaped = child.wait().await.ok();
+        let stderr = drain.await.context("worker stderr task")??;
+        let status = match outcome {
+            Ok(status) => status,
+            Err(code) => {
+                return Err(diagnostics::failure(
+                    &self.config,
+                    code,
+                    "worker",
+                    "worker",
+                    reaped,
+                    started,
+                    &stderr,
+                )
+                .into());
+            }
+        };
+        if !status.success() {
+            use std::os::unix::process::ExitStatusExt;
+            let code = match status.signal() {
+                Some(nix::libc::SIGXCPU) => "worker_cpu_limit",
+                Some(_) => "worker_signal",
+                None => "worker_exit_failed",
+            };
+            return Err(diagnostics::failure(
+                &self.config,
+                code,
+                "worker",
+                "worker",
+                Some(status),
+                started,
+                &stderr,
+            )
+            .into());
+        }
         ensure!(!cancel.is_cancelled(), "cancelled");
         let result_path = job_path.with_extension("result.json");
         ensure!(
@@ -786,7 +960,7 @@ impl App {
         if let Some(e) = r.error {
             bail!("{e}")
         };
-        ensure!(!r.files.is_empty(), "empty worker result");
+        ensure!(!r.files.is_empty() || r.empty, "empty worker result");
         let mut files = vec![];
         let mut total = 0;
         for a in r.files {
@@ -816,6 +990,9 @@ impl App {
             key,
             profile: worker::PROFILE.into(),
             files,
+            selected_location: Some(job.target.id),
+            empty: r.empty,
+            options:json!({"selector":selector,"archive":archive,"decryption":self.config.decryption(&job.target.key),"ffmpeg_threads":self.config.ffmpeg_threads,"media_identity":self.media_identity.get(),"local_source_identity":self.config.local_source.as_ref().map(|s|s.identity())}),
             sources:inputs.iter().map(|i|json!({"internal_id":i.input.location.internal,"provider":i.input.location.provider,"options":i.input.location.options,"download_sha256":i.raw_sha256})).collect(),
         };
         tokio::fs::write(
@@ -873,7 +1050,9 @@ impl<E: Into<anyhow::Error>> From<E> for ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let message = self.0.to_string();
-        let status = if message.contains("not found") {
+        let status = if message.contains("task persistence unavailable") {
+            StatusCode::SERVICE_UNAVAILABLE
+        } else if message.contains("not found") {
             StatusCode::NOT_FOUND
         } else if message.contains("queue full") {
             StatusCode::TOO_MANY_REQUESTS
@@ -891,6 +1070,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/v1/catalogs/refresh", post(refresh))
         .route("/v1/assets", get(assets))
         .route("/v1/exports", post(exports))
+        .route("/v1/preflight", post(preflight))
         .route("/v1/exports/{id}", get(manifest))
         .route("/v1/tasks/{id}", get(task))
         .route("/v1/tasks/{id}/cancel", post(cancel))
@@ -899,6 +1079,9 @@ pub fn router(app: Arc<App>) -> Router {
         .with_state(app)
 }
 async fn ready(State(app): State<Arc<App>>) -> std::result::Result<Json<Value>, ApiError> {
+    if !app.unpersisted_tasks.lock().unwrap().is_empty() {
+        return Err(anyhow::anyhow!("task persistence unavailable").into());
+    }
     sqlx::query("SELECT 1").execute(&app.db).await?;
     if app.shutdown.is_cancelled() {
         return Err(anyhow::anyhow!("shutting down").into());
@@ -955,6 +1138,9 @@ async fn task(
     State(app): State<Arc<App>>,
     Param(id): Param<String>,
 ) -> std::result::Result<Json<Value>, ApiError> {
+    if let Some(task) = app.unpersisted_tasks.lock().unwrap().get(&id) {
+        return Ok(Json(serde_json::to_value(task)?));
+    }
     let b: Option<String> = sqlx::query_scalar("SELECT body FROM tasks WHERE id=?")
         .bind(id)
         .fetch_optional(&app.db)
@@ -1059,9 +1245,317 @@ async fn file(
     Ok(response)
 }
 
+async fn preflight(
+    State(app): State<Arc<App>>,
+    Json(request): Json<ExportRequest>,
+) -> std::result::Result<Json<Value>, ApiError> {
+    ensure_preflight(&app, request)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+async fn ensure_preflight(app: &App, request: ExportRequest) -> Result<Value> {
+    ensure!(
+        request.prefix.is_some() != !request.keys.is_empty(),
+        "provide either keys or prefix"
+    );
+    let (snapshot, catalog) = app.snapshot(request.snapshot.as_deref()).await?;
+    let mut keys: Vec<_> = if let Some(prefix) = request.prefix {
+        catalog
+            .keys
+            .keys()
+            .filter(|k| k.starts_with(&prefix))
+            .take(app.config.max_keys + 1)
+            .cloned()
+            .collect()
+    } else {
+        request.keys
+    };
+    keys.sort();
+    keys.dedup();
+    ensure!(
+        !keys.is_empty() && keys.len() <= app.config.max_keys,
+        "empty or excessive selection"
+    );
+    ensure!(
+        request.selector.location_id.is_none() || keys.len() == 1,
+        "location_id requires exactly one key"
+    );
+    let mut results = vec![];
+    for key in keys {
+        let candidates: Vec<_> = catalog
+            .keys
+            .get(&key)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| catalog.locations.get(id))
+            .map(|l| json!({"location_id":l.id,"resource_type":l.resource_type}))
+            .collect();
+        let target = match catalog.resolve(&key, &request.selector) {
+            Ok(v) => v,
+            Err(e) => {
+                results.push(json!({"key":key,"status":if candidates.len()>1{"ambiguous"}else{"missing"},"error":e.to_string(),"candidates":candidates}));
+                continue;
+            }
+        };
+        let mut closure = match catalog.closure_from(target.id) {
+            Ok(v) => v,
+            Err(e) => {
+                results.push(json!({"key":key,"status":"missing","error":e.to_string()}));
+                continue;
+            }
+        };
+        let mut embedded_cri = false;
+        if target.resource_type.starts_with("CriWare.") && !request.archive {
+            let raw: Vec<_> = closure
+                .iter()
+                .filter(|l| l.provider == crate::catalog::CRI)
+                .cloned()
+                .collect();
+            if raw.is_empty() {
+                embedded_cri = true;
+                closure.retain(|l| {
+                    !l.internal
+                        .rsplit('/')
+                        .next()
+                        .is_some_and(|n| n.to_ascii_lowercase().contains("monoscripts"))
+                });
+            } else {
+                closure = raw;
+            }
+        }
+        let mut dependencies = vec![];
+        let mut missing = false;
+        let mut local = false;
+        for l in &closure {
+            let remote = l.internal.starts_with("https://") || l.internal.starts_with("http://");
+            let status = if remote {
+                "remote"
+            } else {
+                local = true;
+                if app.config.local_source.as_ref().is_some_and(|s| {
+                    s.open(&l.internal)
+                        .is_ok_and(|(_, e)| l.options.as_ref().is_some_and(|o| o.size == e.bytes))
+                }) {
+                    "local"
+                } else {
+                    missing = true;
+                    "missing"
+                }
+            };
+            dependencies.push(json!({"location_id":l.id,"internal_id":l.internal,"status":status}));
+        }
+        let supported = request.archive
+            || matches!(
+                target.resource_type.as_str(),
+                "UnityEngine.Texture2D"
+                    | "UnityEngine.Sprite"
+                    | "UnityEngine.TextAsset"
+                    | "UnityEngine.U2D.SpriteAtlas"
+            )
+            || target.resource_type.starts_with("CriWare.")
+            || target.provider == crate::catalog::CRI;
+        let cri = target.resource_type.starts_with("CriWare.") && !request.archive;
+        let status = if cri && !embedded_cri && closure.len() > 1 {
+            "ambiguous"
+        } else if missing || closure.is_empty() {
+            "missing"
+        } else if !supported {
+            "unsupported"
+        } else if local {
+            "local"
+        } else {
+            "remote"
+        };
+        results.push(json!({"key":key,"status":status,"location_id":target.id,"resource_type":target.resource_type,"dependencies":dependencies,"candidates":candidates,"payload":if embedded_cri{"embedded_cri_candidate"}else{"raw"},"error":if cri&&closure.is_empty(){Some("missing_cri_payload")}else if cri&&!embedded_cri&&closure.len()>1{Some("ambiguous_cri_payload")}else{None}}));
+    }
+    Ok(
+        json!({"snapshot":snapshot.id,"profile":worker::PROFILE,"validation":"dependency availability only; payload hashes and codec validity are checked during export","results":results}),
+    )
+}
+
 #[cfg(test)]
 mod review_tests {
     use super::*;
+    #[tokio::test]
+    async fn final_sql_failure_is_visible_and_blocks_new_work() {
+        use http_body_util::BodyExt;
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::open(Config {
+            data_dir: dir.path().into(),
+            cdn_root: "https://cdn.invalid".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let (mut task, _, permit) = app
+            .new_task("export", None, 1, vec!["one".into()])
+            .await
+            .unwrap();
+        task.results.push(ItemResult {
+            key: "one".into(),
+            export_id: Some("published".into()),
+            error: None,
+        });
+        task.completed = 1;
+        task.state = "succeeded".into();
+        sqlx::raw_sql("CREATE TRIGGER fail_final BEFORE UPDATE ON tasks WHEN json_extract(NEW.body, '$.state') IN ('succeeded','failed') BEGIN SELECT RAISE(FAIL, 'injected write failure'); END;").execute(&app.db).await.unwrap();
+        app.finish_task(&mut task).await;
+        drop(permit);
+        assert_eq!(task.state, "failed");
+        assert!(task.error.as_deref().unwrap().contains("persistence"));
+        let response = router(app.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/tasks/{}", task.id))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let task: Task = serde_json::from_slice(&body).unwrap();
+        assert_eq!(task.state, "failed");
+        assert_eq!(task.results[0].export_id.as_deref(), Some("published"));
+        assert!(
+            app.new_task("export", None, 1, vec!["two".into()])
+                .await
+                .is_err()
+        );
+        let response = router(app.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        app.cancellations.lock().unwrap().clear();
+        app.stop().await;
+    }
+    #[tokio::test]
+    async fn tree_filters_old_profile_and_rejects_case_collisions() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("data");
+        let app = App::open(Config {
+            data_dir: data.clone(),
+            cdn_root: "https://cdn.invalid".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        for (id, profile, key) in [
+            ("a", "json-png-aac-h264-v1", "Image/A"),
+            ("b", worker::PROFILE, "Image/A"),
+        ] {
+            let path = data.join("exports").join(id);
+            std::fs::create_dir(&path).unwrap();
+            std::fs::write(path.join("00000.txt"), b"fixture").unwrap();
+            let m = Manifest {
+                id: id.into(),
+                snapshot: "s".into(),
+                key: key.into(),
+                profile: profile.into(),
+                files: vec![PublishedFile {
+                    id: format!("f{id}"),
+                    artifact: Artifact {
+                        name: "00000.txt".into(),
+                        label: "same".into(),
+                        media_type: "text/plain".into(),
+                        bytes: 7,
+                        sha256: crypto::digest(b"fixture"),
+                        metadata: json!({"stable_id":"object-1"}),
+                    },
+                }],
+                sources: vec![],
+                selected_location: None,
+                empty: false,
+                options: Value::Null,
+            };
+            sqlx::query("INSERT INTO exports(id,body) VALUES(?,?)")
+                .bind(id)
+                .bind(serde_json::to_string(&m).unwrap())
+                .execute(&app.db)
+                .await
+                .unwrap();
+        }
+        let tree = root.path().join("tree");
+        let index = crate::tree::export(&data, &tree, None, false)
+            .await
+            .unwrap();
+        assert_eq!(index.objects.len(), 1);
+        assert_eq!(index.objects[0].profile, worker::PROFILE);
+        let old = crate::tree::export_profile(
+            &data,
+            &root.path().join("old"),
+            None,
+            true,
+            "json-png-aac-h264-v1",
+        )
+        .await
+        .unwrap();
+        assert_eq!(old.objects[0].export_id, "a");
+        let mut m = app.manifest("b").await.unwrap().unwrap();
+        m.id = "c".into();
+        m.key = "Image/a".into();
+        m.files[0].id = "other".into();
+        m.files[0].artifact.metadata = json!({"stable_id":"other"});
+        std::fs::create_dir(data.join("exports/c")).unwrap();
+        std::fs::write(data.join("exports/c/00000.txt"), b"fixture").unwrap();
+        sqlx::query("INSERT INTO exports(id,body) VALUES(?,?)")
+            .bind("c")
+            .bind(serde_json::to_string(&m).unwrap())
+            .execute(&app.db)
+            .await
+            .unwrap();
+        assert!(
+            crate::tree::export(&data, &root.path().join("collision"), None, false)
+                .await
+                .is_err()
+        );
+        app.stop().await;
+    }
+    #[test]
+    fn cache_identity_includes_selection_media_and_decryption() {
+        let mut c = Config::default();
+        let selector = Selector::default();
+        let old = crypto::digest(
+            &serde_json::to_vec(&("snapshot", "key", "json-png-aac-h264-v1")).unwrap(),
+        );
+        let base = export_id("snapshot", "key", &c, &selector, false, "ffmpeg-a");
+        assert_ne!(base, old);
+        assert_ne!(
+            base,
+            export_id("snapshot", "key", &c, &selector, true, "ffmpeg-a")
+        );
+        assert_ne!(
+            base,
+            export_id("snapshot", "key", &c, &selector, false, "ffmpeg-b")
+        );
+        assert_ne!(
+            base,
+            export_id(
+                "snapshot",
+                "key",
+                &c,
+                &Selector {
+                    location_id: Some(1),
+                    expected_type: None
+                },
+                false,
+                "ffmpeg-a"
+            )
+        );
+        c.usm_decryption_overrides
+            .insert("key".into(), crate::usm::Decryption::Plaintext);
+        assert_ne!(
+            base,
+            export_id("snapshot", "key", &c, &selector, false, "ffmpeg-a")
+        );
+    }
     #[test]
     fn failed_publication_is_removed_but_committed_is_kept() {
         let root = tempfile::tempdir().unwrap();

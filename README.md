@@ -4,7 +4,7 @@ A Rust HTTP service for retrieving and exporting Our Notes assets. It reads an
 Android Addressables catalog, downloads the selected dependencies, decrypts
 supported resources, and publishes usable files on local disk.
 
-Version **0.1.0-alpha.1**. This is an independent interoperability project, not an
+Version **0.1.0-alpha.2**. This is an independent interoperability project, not an
 official game service. The HTTP v1 and Rust interfaces are experimental.
 
 ## Supported Resources
@@ -14,9 +14,13 @@ official game service. The HTTP v1 and Rust interfaces are experimental.
 | TextAsset, including gzip content | Original JSON, SUS, UTF-8 text, or binary payload |
 | Texture2D, Sprite, populated SpriteAtlas | PNG |
 | ACB with embedded HCA waveforms | AAC-LC in M4A, with cue-name metadata |
-| Supported USM video | H.264/AAC MP4 |
+| USM MPEG/VP9, including separate alpha | H.264/AAC MP4 + lossless gray FFV1 mask when present |
+| Embedded serialized ACB | AAC-LC M4A, selected by exact wrapper reference |
+| Empty SpriteAtlas | Empty manifest, no fabricated image |
+| Explicit Unity archive mode | CRC-validated Unity bundles |
 
-Unity parsing uses `unity-rs-core 0.5.1`; CRI parsing uses `cridecoder 0.3.5`.
+Unity parsing uses `unity-rs-core 0.5.1`; ACB/HCA parsing uses `cridecoder 0.3.5`.
+USM uses the bounded in-project demuxer; see [media contracts](docs/MEDIA.md).
 FFmpeg runs as a separate process. **No Python, C#, Unity Editor, proprietary CRI
 plugin, game login, or player credentials are required at runtime.**
 
@@ -28,14 +32,14 @@ exported versions remain available after a refresh.
 
 Not supported: arbitrary game versions/platforms, external streaming AWB banks,
 CPK, scene/model/animation exports, complex cue playback, song-segment assembly,
-multichannel audio, alpha video, and ambiguous multi-track video. Missing local
-APK dependencies produce explicit failures; the service does not guess URLs for
-embedded resources. Asset availability and rights remain the publisher's concern.
+multichannel audio and ambiguous multi-track video. Local dependencies require an
+explicit hash-pinned source from the matching game version; missing or mismatched
+files fail. Ambiguous keys require a type/location selector. Asset availability and rights remain the publisher's concern.
 
 ## Install
 
 Requirements: Linux, Rust 1.98.1, a C compiler/pkg-config for native dependencies,
-FFmpeg/ffprobe with AAC and libx264, and `prlimit` from util-linux.
+FFmpeg/ffprobe with AAC, libx264 and FFV1, and `prlimit` from util-linux.
 
 ```sh
 cargo build --release --locked
@@ -99,15 +103,36 @@ loaded into memory by the Unity worker; large files retain file-backed sources.
 This is not a promise of zero-copy parsing or unpacking before a download ends.
 Cancellation terminates worker process groups. Shared work continues while
 another caller still needs it. Restart clears temporary files and marks unfinished
-tasks failed; resubmit their keys to retry. Partial HTTP-byte-range download resume
+tasks failed and accounts for every key in new tasks; resubmit failed keys to retry.
+Task persistence failures are surfaced as failed tasks, with readiness/new work
+blocked if final progress can only be retained in memory. Subprocess failures have
+stage/exit/signal summaries and private, bounded stderr diagnostics under
+`data_dir/diagnostics`; apply an operator retention policy to that directory. Partial HTTP-byte-range download resume
 is not implemented.
 
 Audio uses 96 kbps mono / 192 kbps stereo AAC without normalization. Video uses
-H.264 CRF 20, medium, yuv420p and faststart, preserving frame rate and dimensions
-except padding odd dimensions to even. Video without audio stays silent. Output
+H.264 CRF 20, medium, yuv420p and faststart with the USM rational frame rate and
+display size, padding odd dimensions to even. ADX normalization is sample-exact;
+alpha has an explicit color-plus-mask contract. Video without audio stays silent. Output
 media is probed and fully decoded before publication; codec versions may affect
 compressed bytes, so SHA256 identifies actual output rather than a universal
 cross-version encoding result.
+
+## Preflight and readable files
+
+`POST /v1/preflight` accepts the export selection and reports remote/local/missing,
+ambiguous or unsupported dependencies without downloading. `selector` accepts
+`expected_type` or `location_id`; a location ID requires a single key. Use
+`archive: true` only for a validated Unity-container archive.
+
+```sh
+moenotes-assets export-tree DATA_DIR DESTINATION SNAPSHOT_ID copy
+moenotes-assets upload-tree DESTINATION s3.toml
+```
+
+See [export contracts](docs/EXPORT.md) for naming, local sources, conditional S3
+creation, credentials and immutable migration rules. Upload is an explicit CLI
+operation and is never triggered by a service request.
 
 ## Container
 
@@ -130,7 +155,9 @@ requirements before publishing it; see [Third-Party Notices](THIRD_PARTY_NOTICES
 
 ## API and Development
 
-See [HTTP API](docs/API.md), [architecture](docs/ARCHITECTURE.md), and
+See [HTTP API](docs/API.md), [media](docs/MEDIA.md),
+[local/tree/S3 export](docs/EXPORT.md), [development rules](docs/DEVELOPMENT.md),
+[architecture](docs/ARCHITECTURE.md), and
 [changelog](CHANGELOG.md). Internal worker JSON is not a public integration API.
 
 ```sh
@@ -142,8 +169,8 @@ cargo doc --no-deps --locked
 
 Tests use synthetic files and loopback HTTP, not publisher endpoints. Private
 real-resource acceptance data is intentionally excluded from the repository.
-Only documented inputs are supported; unsupported data is not reported as a
-successful raw-container export.
+Only documented inputs are supported. Container archives require explicit archive
+mode and are identified separately from usable previews.
 
 GitHub Actions runs format, lint, tests, documentation and Release builds with
 Cargo caching. CI does not publish binaries, images or game resources.

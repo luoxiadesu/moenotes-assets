@@ -143,6 +143,9 @@ impl Bin {
     }
 }
 pub fn catalog(size: u64, crc: u32) -> Vec<u8> {
+    catalog_with_internal(size, crc, "https://dummy.net/asset/Android/fixture.bundle")
+}
+pub fn catalog_with_internal(size: u64, crc: u32, internal: &str) -> Vec<u8> {
     let mut b = Bin(vec![0; 32]);
     let h = b.put(&[1; 16]);
     let bn = b.string("fixture");
@@ -151,7 +154,7 @@ pub fn catalog(size: u64, crc: u32) -> Vec<u8> {
     let ot = b.typ("UnityEngine.ResourceManagement.ResourceProviders.AssetBundleRequestOptions");
     let extra = b.words(&[ot, opt]);
     let bk = b.string("fixture.bundle");
-    let bi = b.string("https://dummy.net/asset/Android/fixture.bundle");
+    let bi = b.string(internal);
     let bp = b.string(moenotes_assets::catalog::CRYPT);
     let bt = b.typ("UnityEngine.ResourceManagement.ResourceProviders.IAssetBundleResource");
     let bundle = b.words(&[bk, bi, bp, u32::MAX, 0, extra, bt]);

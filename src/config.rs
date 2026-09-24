@@ -29,6 +29,14 @@ pub struct Config {
     pub ffmpeg: String,
     pub ffprobe: String,
     pub cri_key: u64,
+    pub local_source: Option<crate::local::Source>,
+    pub usm_decryption: crate::usm::Decryption,
+    /// Exact logical-key overrides; no heuristic fallback after decode failure.
+    pub usm_decryption_overrides: std::collections::BTreeMap<String, crate::usm::Decryption>,
+    pub worker_cpu_seconds: Option<u64>,
+    pub worker_wall_seconds: Option<u64>,
+    pub video_cpu_seconds: Option<u64>,
+    pub video_wall_seconds: Option<u64>,
     /// Local test servers only; never permits a non-loopback HTTP origin.
     pub allow_loopback_http: bool,
 }
@@ -59,12 +67,40 @@ impl Default for Config {
             ffmpeg: "ffmpeg".into(),
             ffprobe: "ffprobe".into(),
             cri_key: 8_594_927_479,
+            local_source: None,
+            usm_decryption: Default::default(),
+            usm_decryption_overrides: Default::default(),
+            worker_cpu_seconds: None,
+            worker_wall_seconds: None,
+            video_cpu_seconds: None,
+            video_wall_seconds: None,
             allow_loopback_http: false,
         }
     }
 }
 
 impl Config {
+    pub fn decryption(&self, key: &str) -> crate::usm::Decryption {
+        self.usm_decryption_overrides
+            .get(key)
+            .copied()
+            .unwrap_or(self.usm_decryption)
+    }
+    pub fn worker_limits(&self, video: bool) -> (u64, u64) {
+        let cpu = self.worker_cpu_seconds.unwrap_or(
+            self.worker_timeout_secs
+                .saturating_mul(self.ffmpeg_threads as u64),
+        );
+        let wall = self.worker_wall_seconds.unwrap_or(self.worker_timeout_secs);
+        if video {
+            (
+                self.video_cpu_seconds.unwrap_or(cpu),
+                self.video_wall_seconds.unwrap_or(wall),
+            )
+        } else {
+            (cpu, wall)
+        }
+    }
     pub fn validate(&self) -> Result<()> {
         for (name, n, max) in [
             ("downloads", self.downloads, 64),
@@ -114,6 +150,31 @@ impl Config {
                         .all(|c| c.is_ascii_alphanumeric() || b"_-".contains(&c)),
                 "invalid configuration component"
             );
+        }
+        for seconds in [
+            self.worker_cpu_seconds,
+            self.worker_wall_seconds,
+            self.video_cpu_seconds,
+            self.video_wall_seconds,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            ensure!(
+                (1..=5_529_600).contains(&seconds),
+                "invalid CPU/wall budget"
+            );
+        }
+        ensure!(
+            self.usm_decryption_overrides.len() <= 50_000
+                && self
+                    .usm_decryption_overrides
+                    .keys()
+                    .all(|k| k.len() <= 4096),
+            "decryption override limit"
+        );
+        if let Some(source) = &self.local_source {
+            source.validate()?;
         }
         self.root()?;
         Ok(())
@@ -209,5 +270,21 @@ mod tests {
         ] {
             assert!(c.asset_url(u).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    #[test]
+    fn independent_cpu_wall_and_video_overrides() {
+        let mut c = Config::default();
+        assert_eq!(c.worker_limits(false), (3600, 900));
+        c.worker_cpu_seconds = Some(2);
+        c.worker_wall_seconds = Some(3);
+        c.video_cpu_seconds = Some(5);
+        c.video_wall_seconds = Some(7);
+        assert_eq!(c.worker_limits(false), (2, 3));
+        assert_eq!(c.worker_limits(true), (5, 7));
     }
 }

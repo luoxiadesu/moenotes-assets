@@ -7,6 +7,12 @@ pub const PLAIN: &str = "UnityEngine.ResourceManagement.ResourceProviders.AssetB
 pub const CRI: &str = "CriWare.Assets.CriResourceProvider";
 const NULL: u32 = u32::MAX;
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Selector {
+    pub expected_type: Option<String>,
+    pub location_id: Option<u32>,
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Options {
     pub hash: String,
@@ -238,24 +244,40 @@ impl Catalog {
         Ok(Self { keys, locations })
     }
     pub fn target(&self, key: &str) -> Result<&Location> {
+        self.resolve(key, &Selector::default())
+    }
+    pub fn resolve(&self, key: &str, selector: &Selector) -> Result<&Location> {
         let ids = self.keys.get(key).context("asset key not found")?;
-        let first = self
-            .locations
-            .get(ids.first().context("empty asset key")?)
-            .context("location missing")?;
-        for id in ids {
-            let other = self.locations.get(id).context("location missing")?;
-            ensure!(
-                other.internal == first.internal
-                    && other.provider == first.provider
-                    && other.dependencies == first.dependencies,
-                "ambiguous asset key"
-            );
-        }
+        let candidates = ids
+            .iter()
+            .map(|id| self.locations.get(id).context("location missing"))
+            .collect::<Result<Vec<_>>>()?;
+        let selected: Vec<_> = candidates
+            .into_iter()
+            .filter(|l| {
+                selector.location_id.is_none_or(|id| id == l.id)
+                    && selector
+                        .expected_type
+                        .as_ref()
+                        .is_none_or(|t| t == &l.resource_type)
+            })
+            .collect();
+        let first = *selected
+            .first()
+            .context("selector did not match a location")?;
+        ensure!(
+            selected.iter().all(|other| other.internal == first.internal
+                && other.provider == first.provider
+                && other.dependencies == first.dependencies),
+            "ambiguous asset key; select expected_type or location_id"
+        );
         Ok(first)
     }
     pub fn closure(&self, key: &str) -> Result<Vec<Location>> {
-        let mut todo = vec![self.target(key)?.id];
+        self.closure_from(self.target(key)?.id)
+    }
+    pub fn closure_from(&self, id: u32) -> Result<Vec<Location>> {
+        let mut todo = vec![id];
         let mut seen = BTreeSet::new();
         let mut out = vec![];
         while let Some(id) = todo.pop() {

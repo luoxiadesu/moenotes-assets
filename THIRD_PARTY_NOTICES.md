@@ -5,6 +5,9 @@ FFmpeg, game files, game trademarks, or exported media.
 
 - `unity-rs-core 0.5.1`: MIT; https://github.com/seiunx-dev/unity-rs.
 - `cridecoder 0.3.5`: MIT; https://github.com/seiunx-dev/cridecoder.
+  `src/usm.rs` adapts its MIT-licensed packet-mask routines; the demuxer and
+  bounded metadata reader are implemented in this project. The upstream license
+  is retained under `third_party/licenses/cridecoder-0.3.5/LICENSE`.
   Its optional Python feature is disabled. Neither Python nor C# is a runtime dependency.
 - Rust dependencies and selected versions are recorded in Cargo.lock. License files
   collected from the corresponding crate sources are under `third_party/licenses`.

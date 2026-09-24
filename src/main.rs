@@ -42,6 +42,43 @@ fn main() -> Result<()> {
         println!("moenotes-assets {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
+    if args.get(1).is_some_and(|s| s == "upload-tree") {
+        anyhow::ensure!(
+            args.len() == 4,
+            "usage: moenotes-assets upload-tree TREE S3_CONFIG.toml"
+        );
+        let config: moenotes_assets::upload::Config =
+            toml::from_str(&std::fs::read_to_string(&args[3])?)?;
+        return tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(async {
+                let cancel = tokio_util::sync::CancellationToken::new();
+                let signal = cancel.clone();
+                tokio::spawn(async move {
+                    let _ = tokio::signal::ctrl_c().await;
+                    signal.cancel();
+                });
+                moenotes_assets::upload::upload(std::path::Path::new(&args[2]), config, cancel)
+                    .await
+            });
+    }
+    if args.get(1).is_some_and(|s| s == "export-tree") {
+        anyhow::ensure!(
+            (4..=7).contains(&args.len()),
+            "usage: moenotes-assets export-tree DATA_DIR DESTINATION [SNAPSHOT] [copy|hardlink] [PROFILE]"
+        );
+        let snapshot = args
+            .get(4)
+            .filter(|s| s.as_str() != "-")
+            .map(String::as_str);
+        let mode = args.get(5).map(String::as_str).unwrap_or("copy");
+        anyhow::ensure!(matches!(mode, "copy" | "hardlink"), "invalid copy mode");
+        return tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(async {
+            let index=moenotes_assets::tree::export_profile(std::path::Path::new(&args[2]),std::path::Path::new(&args[3]),snapshot,mode=="hardlink",args.get(6).map(String::as_str).unwrap_or(worker::PROFILE)).await?;
+            println!("{}",serde_json::json!({"objects":index.objects.len(),"schema":index.schema,"naming":index.naming}));Ok(())
+        });
+    }
     if args.len() != 3 || args[1] != "serve" {
         bail!("usage: moenotes-assets serve CONFIG.toml | --version")
     }
