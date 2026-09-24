@@ -4,7 +4,7 @@ A Rust HTTP service for retrieving and exporting Our Notes assets. It reads an
 Android Addressables catalog, downloads the selected dependencies, decrypts
 supported resources, and publishes usable files on local disk.
 
-Version **0.1.0-alpha.3**. This is an independent interoperability project, not an
+Version **0.1.0-alpha.4**. This is an independent interoperability project, not an
 official game service. The HTTP v1 and Rust interfaces are experimental.
 
 ## Supported Resources
@@ -15,6 +15,7 @@ official game service. The HTTP v1 and Rust interfaces are experimental.
 | Texture2D, Sprite, populated SpriteAtlas | PNG |
 | ACB with embedded HCA waveforms | AAC-LC in M4A, with cue-name metadata |
 | USM MPEG/VP9, including separate alpha | H.264/AAC MP4 + lossless gray FFV1 mask when present |
+| SplitAcbData song containers | Ordered chunk recovery to ACB, then AAC-LC M4A |
 | Embedded serialized ACB | AAC-LC M4A, selected by exact wrapper reference |
 | Empty SpriteAtlas | Empty manifest, no fabricated image |
 | HTTP container archive | CRC-validated Unity bundles or original CRI containers |
@@ -32,7 +33,7 @@ Explicit archive tasks publish retained HTTP containers. Catalog snapshots and o
 exported versions remain available after a refresh.
 
 Not supported: arbitrary game versions/platforms, external streaming AWB banks,
-CPK, scene/model/animation exports, complex cue playback, song-segment assembly,
+CPK, scene/model/animation exports, complex cue playback,
 multichannel audio and ambiguous multi-track video. Resource retrieval uses HTTP(S) only. Package-only dependencies are listed in
 preflight/manifests and never opened or guessed as CDN paths. Missing actual
 image/object references still fail during conversion. Ambiguous keys require a

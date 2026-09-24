@@ -53,6 +53,7 @@ impl Plan {
         }
         ensure!(dependencies.len() <= 512, "dependency count limit");
         let supported = archive
+            || target.resource_type == crate::split_acb::TYPE
             || cri
             || matches!(
                 target.resource_type.as_str(),

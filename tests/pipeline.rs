@@ -553,3 +553,16 @@ fn cri_archive_retains_container_bytes_without_conversion() {
             .contains("no codec conversion")
     );
 }
+
+#[test]
+fn split_acb_type_is_a_preview_capability() {
+    let (bytes, _) = fixture();
+    let mut catalog = Catalog::parse(&bytes).unwrap();
+    let id = catalog.target(KEY).unwrap().id;
+    catalog.locations.get_mut(&id).unwrap().resource_type = "Fwk.Sound.SplitAcbData".into();
+    let plan =
+        moenotes_assets::plan::Plan::build(&catalog, KEY, &Default::default(), false).unwrap();
+    plan.validate().unwrap();
+    assert_eq!(plan.disposition(), "preview");
+    assert!(!plan.archive);
+}

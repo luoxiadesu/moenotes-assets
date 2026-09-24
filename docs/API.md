@@ -145,3 +145,9 @@ For other resources disposition is `preview` or `http-container-archive`.
 Manifests include `dependency_policy`, `omitted_local_dependencies` and
 `dependency_closure_complete`; an archive with missing package dependencies is
 not a complete playable Unity package.
+
+SplitAcbData song keys now report preview support and use the same async export
+endpoint. Their output metadata contains `split_acb` with `cue_sheet`, `chunks`,
+`reconstructed_sha256` and `assembly`. This is separate from `_short` preview
+keys; callers should resolve music and preview keys through their master cue-sheet
+references rather than substitute the short clip for the gameplay song.

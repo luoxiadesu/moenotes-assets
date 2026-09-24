@@ -2,6 +2,16 @@
 
 Versions follow MAJOR.MINOR.PATCH, with prerelease identifiers where applicable.
 
+## 0.1.0-alpha.4 - 2026-09-25
+
+- Export SplitAcbData songs/tutorial audio by resolving TextAsset references in
+  declared order and recovering the ACB with the native XOR mask. Validate chunk
+  references, expansion bounds and the reconstructed header before the existing
+  strict audio conversion pipeline.
+- Record assembly version, cue-sheet name, chunk count and reconstructed source
+  SHA256 in audio metadata. Existing supported-resource cache identities remain
+  unchanged.
+
 ## 0.1.0-alpha.3 - 2026-09-25
 
 - Use one HTTP-only dependency plan for preflight and exports. Preview workers

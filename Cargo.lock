@@ -1085,7 +1085,7 @@ dependencies = [
 
 [[package]]
 name = "moenotes-assets"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "aes",
  "anyhow",

@@ -255,7 +255,22 @@ pub fn run(job: &Job) -> Result<Vec<Artifact>> {
         );
         for (file, id) in targets {
             let object = studio.object(file, id).context("resolved object missing")?;
-            if object.class_id() == 114 && job.target.resource_type.starts_with("CriWare.") {
+            if job.target.resource_type == crate::split_acb::TYPE {
+                let (payload, cue_sheet, chunks) =
+                    crate::split_acb::read(&studio, object, job.config.expanded_bytes)?;
+                let source_sha = crypto::digest(&payload);
+                let p = job
+                    .output
+                    .parent()
+                    .context("worker stage")?
+                    .join("split.acb");
+                std::fs::write(&p, payload)?;
+                let before = output.files.len();
+                cri(&p, &mut output)?;
+                for file in &mut output.files[before..] {
+                    file.metadata["split_acb"] = json!({"cue_sheet":cue_sheet,"chunks":chunks,"reconstructed_sha256":source_sha,"assembly":"ordered-textasset-xor5a-v1"});
+                }
+            } else if object.class_id() == 114 && job.target.resource_type.starts_with("CriWare.") {
                 let file = &studio.collection().serialized_files()[object.file_index()].file;
                 let payload = crate::embedded::read(file, object, job.config.expanded_bytes)?;
                 let p = job

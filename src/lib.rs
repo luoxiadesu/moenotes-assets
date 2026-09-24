@@ -7,6 +7,7 @@ mod embedded;
 pub mod plan;
 pub mod service;
 mod shared;
+mod split_acb;
 mod task_runner;
 pub mod tree;
 pub mod upload;

@@ -84,3 +84,18 @@ not a preview or a decoded model.
 Font data/subresources do not enter preview conversion; see EXPORT.md. Package
 references remain in their retention JSON even when no font bytes are remotely
 available. Explicit archive also supports unchanged CRI container bytes.
+
+## Split song containers
+
+`Fwk.Sound.SplitAcbData` is a supported preview input. The exporter resolves the
+selected wrapper's `_chunks` TextAsset references in serialized array order,
+concatenates their bytes and XORs each byte with `0x5a`, matching the native
+SplitAcbLoader. This reconstructs one ACB; it is not audio segment concatenation.
+The recovered ACB uses the existing strict AWB/HCA/AAC path. Invalid/null chunk
+references, non-TextAsset chunks, empty arrays, expansion overflow and invalid
+ACB headers fail. Output metadata records the cue-sheet name, chunk count,
+reconstructed ACB SHA256 and `ordered-textasset-xor5a-v1` assembly identifier.
+
+The media profile remains v3: this adds a previously unsupported input type and
+does not change outputs or cache identities for already supported resources.
+Failed tasks have no successful export cache to migrate.
