@@ -24,9 +24,8 @@ advisories. Do not include player credentials or copyrighted asset payloads in
 public issues. Describe versions and reproduction steps using synthetic fixtures
 where possible. Only the latest prerelease is maintained at present.
 
-Local source directories and tree outputs are trusted operator-controlled state.
-Do not mutate them while exporting/uploading. Local entries are hash-pinned and
-path/symlink checked, but this is not a sandbox against a malicious local user
-racing filesystem changes. Diagnostic files may contain private input paths from
+Tree outputs are trusted operator-controlled state. Do not mutate them while
+exporting/uploading. The service has no local dependency provider. This is not a
+sandbox against a malicious local user racing indexed filesystem changes. Diagnostic files may contain private input paths from
 external tools; do not expose the diagnostics directory. S3 credentials are read
 only from environment variables and are never written into the public tree.

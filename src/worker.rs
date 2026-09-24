@@ -24,7 +24,7 @@ use unity_rs_core::{
     texture::TextureReadLimits,
 };
 
-pub const PROFILE: &str = "json-png-aac-h264-mask-v2";
+pub const PROFILE: &str = "json-png-aac-h264-mask-http-v3";
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Input {
     pub location: Location,
@@ -38,6 +38,8 @@ pub struct Job {
     pub output: PathBuf,
     #[serde(default)]
     pub archive: bool,
+    #[serde(default)]
+    pub font_reference: Option<Value>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Artifact {
@@ -113,7 +115,10 @@ impl Output<'_> {
 
 pub fn run(job: &Job) -> Result<Vec<Artifact>> {
     job.config.validate()?;
-    ensure!(!job.inputs.is_empty(), "empty worker inputs");
+    ensure!(
+        !job.inputs.is_empty() || (job.archive && job.font_reference.is_some()),
+        "empty worker inputs"
+    );
     std::fs::create_dir(&job.output)?;
     let mut output = Output {
         job,
@@ -121,23 +126,59 @@ pub fn run(job: &Job) -> Result<Vec<Artifact>> {
         total: 0,
     };
     if job.archive {
+        if let Some(reference) = &job.font_reference {
+            output.bytes(
+                &serde_json::to_vec_pretty(reference)?,
+                "json",
+                job.target.key.clone(),
+                "application/json",
+            )?;
+            output.files.last_mut().unwrap().metadata = json!({"role":"font-reference","stable_id":"font-reference","conversion":"not converted"});
+        }
         for input in &job.inputs {
             ensure!(
-                input.location.provider != CRI,
-                "raw CRI archive is not a Unity bundle"
+                crate::plan::remote(&input.location),
+                "archive accepts only HTTP resources"
             );
-            let crc = crypto::bundle_crc(&input.path, job.config.expanded_bytes)?;
-            ensure!(
-                input
-                    .location
-                    .options
-                    .as_ref()
-                    .is_none_or(|o| o.crc == 0 || o.crc == crc),
-                "bundle CRC mismatch"
-            );
-            let path = output.path("bundle");
+            let (extension, mime, metadata) = if input.location.provider == CRI {
+                let mut magic = [0; 4];
+                File::open(&input.path)?.read_exact(&mut magic)?;
+                ensure!(
+                    matches!(&magic, b"@UTF" | b"CRID" | b"AFS2" | b"CPK "),
+                    "unsupported CRI container signature"
+                );
+                (
+                    if &magic == b"CRID" {
+                        "usm"
+                    } else if &magic == b"@UTF" {
+                        "acb"
+                    } else if &magic == b"AFS2" {
+                        "awb"
+                    } else {
+                        "cpk"
+                    },
+                    "application/octet-stream",
+                    json!({"role":"cri-container","stable_id":format!("container-{}",input.location.id),"validation":"length and signature; no codec conversion"}),
+                )
+            } else {
+                let crc = crypto::bundle_crc(&input.path, job.config.expanded_bytes)?;
+                ensure!(
+                    input
+                        .location
+                        .options
+                        .as_ref()
+                        .is_none_or(|o| o.crc == 0 || o.crc == crc),
+                    "bundle CRC mismatch"
+                );
+                (
+                    "bundle",
+                    "application/vnd.unity",
+                    json!({"role":"unity-bundle","stable_id":format!("bundle-{}",input.location.id),"crc32":crc,"location_id":input.location.id}),
+                )
+            };
+            let path = output.path(extension);
             std::fs::copy(&input.path, &path)?;
-            output.add(path,input.location.key.clone(),"application/vnd.unity",json!({"role":"unity-bundle","stable_id":format!("bundle-{}",input.location.id),"crc32":crc,"location_id":input.location.id}))?;
+            output.add(path, input.location.key.clone(), mime, metadata)?;
         }
         return Ok(output.files);
     }

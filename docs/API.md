@@ -11,6 +11,8 @@ opaque service IDs, never arbitrary local paths or URLs.
 | POST /v1/catalogs/refresh | 202, catalog-refresh task |
 | GET /v1/catalogs | Retained snapshots and current flag |
 | GET /v1/assets | Logical keys and types |
+| GET /v1/resources | HTTP resource inventory with total count and pagination |
+| POST /v1/resources/archive | 202, archive every HTTP resource in a snapshot |
 | POST /v1/preflight | Dependency/capability report without downloads |
 | POST /v1/exports | 202, export task; completed work is reused |
 | GET /v1/tasks/{id} | Task state and per-resource results |
@@ -106,19 +108,40 @@ aliases still resolve. Selectors are part of the cache identity. For example:
 ```
 
 `POST /v1/preflight` accepts the same shape and returns the fixed snapshot,
-profile and one report per key: `status` is `remote`, `local`, `missing`,
-`ambiguous`, or `unsupported`. Candidate location IDs/types and dependency
+profile and one report per key: `status` is `remote`, `retained` (fonts), `unavailable_http`, `missing`,
+`ambiguous`, or `unsupported`. Package-only dependencies appear separately in
+`omitted_local_dependencies`, not as inputs to download. Candidate location IDs/types and dependency
 IDs/InternalIds allow the caller to locate the missing link. For CRI wrappers
 with only Unity dependencies, `payload: "embedded_cri_candidate"` means export
 must still validate the exact serialized implementation and contained bank.
-Preflight checks availability/size, not full payload hashes or codec validity.
+Preflight uses the execution plan; it does not perform network, payload hash or
+codec validation. A remote-only plan can still fail if actual references cannot
+be resolved during conversion.
 
-`archive: true` exports validated Unity bundles and their dependencies; it does
+`archive: true` retains available HTTP Unity/CRI containers; it does
 not turn unsupported meshes/scenes/animations into usable converted objects.
 Archive and preview results have distinct cache identities.
 
 USM plaintext overrides are operator configuration, not request-supplied keys.
-See [media profile](MEDIA.md) and [local sources/tree/S3](EXPORT.md). New exports
-use v2; existing v1 manifests/files remain accessible by their old IDs. Re-submit
-requests to populate v2. Selection, decryption, threads, tool versions and pinned
-local sources participate in v2 cache identity.
+See [media profile](MEDIA.md) and [HTTP sources/tree/S3](EXPORT.md). New exports
+use v3; existing v1/v2 manifests/files remain accessible by their old IDs.
+Re-submit requests to populate v3. Selection, decryption, threads, tool versions
+and dependency policy participate in cache identity.
+
+## Remote inventory and font retention
+
+`GET /v1/resources` accepts the same snapshot/prefix/resource_type/offset/limit
+query parameters as asset listing. It returns `total` and HTTP container records
+with `key`, `location_id`, `internal_id`, `provider` and catalog `options`.
+`POST /v1/resources/archive` accepts only optional `snapshot`; all available HTTP
+resource locations are selected once, independently of preview type support.
+Poll the returned task through the normal task endpoint.
+
+Font keys and aliases are automatically retained: `options.disposition` is
+`font-archive` (reference + remote bundles) or `font-reference` (reference only).
+They are successful retention results, not converted font previews. The JSON
+explicitly records omitted package entries and that their bytes were not fetched.
+For other resources disposition is `preview` or `http-container-archive`.
+Manifests include `dependency_policy`, `omitted_local_dependencies` and
+`dependency_closure_complete`; an archive with missing package dependencies is
+not a complete playable Unity package.

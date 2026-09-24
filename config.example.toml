@@ -38,4 +38,4 @@ usm_decryption = "key"
 # [usm_decryption_overrides]
 # "Example/KnownPlaintextVideo" = "plaintext"
 
-# See docs/EXPORT.md for hash-pinned local_source mappings.
+# HTTP(S) resources only. Package dependencies are recorded, never read locally.

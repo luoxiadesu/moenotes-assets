@@ -1,28 +1,37 @@
 # Local sources, readable trees and S3
 
-## Pinned local dependencies
+## HTTP-only retrieval
 
-Use an explicitly extracted, read-only directory with exact catalog InternalId
-mappings. The service never extracts arbitrary APK members or guesses a CDN URL.
-An operator can extract the matching APK's Addressables directory ahead of time.
-Each entry pins raw bytes, length and SHA256. It must also match the catalog size;
-nonzero catalog CRC is checked after decryption by the worker. An older APK is
-not an acceptable replacement merely because a filename matches.
+The service only fetches catalog InternalIds beginning with HTTP(S), rebased onto
+the configured CDN under the existing URL/redirect/TLS constraints. It neither
+reads an APK/directory provider nor guesses remote paths for package entries.
+`local_source` from alpha.2 is no longer accepted; remove it when upgrading.
+Existing offline files and published exports are left untouched.
 
-```toml
-[local_source]
-root = "/srv/authorized-assets"
+Preflight and export share one dependency plan (`http-resources-v1`). All remote
+Unity dependencies are kept for image/text previews; package-only runtime
+scripts/shaders are omitted and listed in the manifest. A successful download
+alone is insufficient: unresolved target objects, textures and actual external
+references still fail in the worker. Raw CRI wrappers use the unique HTTP payload
+or the validated embedded-ACB path.
 
-[local_source.entries."{UnityEngine.AddressableAssets.Addressables.RuntimePath}/Android/example.bundle"]
-path = "Android/example.bundle"
-bytes = 1234
-sha256 = "REPLACE_WITH_64_HEX_DIGITS"
-```
+Font families, including Texture2D/Material aliases of a font key, are retained
+without conversion. A remote font produces a reference JSON and validated remote
+bundles. A package-only font produces only the reference JSON, with
+`package_payload_downloaded: false`; this is not a downloaded font or an empty
+atlas. Existing package font bytes stay in the operator's offline archive.
 
-Relative paths must be normal components. Absolute paths, traversal, backslashes,
-symlinks and canonical escapes are refused. Keep the root and its parents under
-operator control and immutable during reads. Preflight checks availability and
-catalog size; only an actual export performs the full hash/CRC check.
+`GET /v1/resources` lists directly addressable HTTP resource locations, including
+containers with no preview converter. `POST /v1/resources/archive` with `{}` or
+`{"snapshot":"ID"}` submits all such locations as a normal bounded task. Catalog
+keys remain mapped to unique resource locations; missing/ambiguous primary-key
+mappings are rejected instead of silently skipped. Task limits still apply.
+
+Archive mode now means available HTTP containers, not a complete runtime bundle
+closure. Non-HTTP dependencies are listed and `dependency_closure_complete` is
+false whenever any were omitted. CRI archives validate length/signature and
+preserve original bytes, without claiming codec decode success; Unity archives
+retain decrypted bundles with nonzero CRC validation. No local provider is used.
 
 ## Readable export
 
@@ -32,7 +41,7 @@ moenotes-assets export-tree DATA_DIR DESTINATION SNAPSHOT_ID copy [PROFILE]
 # Optional hardlink mode requires the same filesystem.
 ```
 
-The optional profile defaults to v2, so retained v1 records do not conflict with
+The optional profile defaults to v3, so retained v1/v2 records do not conflict with
 new exports. Pass an old profile explicitly to export an older generation to a
 separate tree. The source index is opened read-only. The tree root is the encoded original key,
 e.g. `Image/Jacket/.../label~stable-id.png`; hash export directories stay internal.

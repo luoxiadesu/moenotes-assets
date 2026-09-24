@@ -2,6 +2,22 @@
 
 Versions follow MAJOR.MINOR.PATCH, with prerelease identifiers where applicable.
 
+## 0.1.0-alpha.3 - 2026-09-25
+
+- Use one HTTP-only dependency plan for preflight and exports. Preview workers
+  resolve real object/texture references without requiring package-only runtime
+  scripts and shaders; omitted entries remain visible in manifests.
+- Retain font keys and their aliases without font conversion: reference JSON plus
+  available remote bundles, or an explicit package-only reference when no HTTP
+  payload exists. Font reference retention does not claim downloaded font bytes.
+- Add paginated HTTP resource inventory and a batch archive endpoint covering
+  all directly addressable resources, including original CRI containers.
+- Remove the alpha.2 local directory provider and `local_source` configuration;
+  old configs must remove that field. Archive now means HTTP containers, with
+  incomplete runtime dependency closures explicitly identified.
+- Use profile v3 and dependency-policy cache identity; keep old exports readable.
+  The tree naming contract remains v2 and defaults to the current media profile.
+
 ## 0.1.0-alpha.2 - 2026-09-24
 
 - Fix batch checkpoint SQL-pool starvation with independently scheduled, bounded

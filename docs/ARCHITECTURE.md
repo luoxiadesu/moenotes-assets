@@ -20,9 +20,11 @@ failed checkpoints and cancellation account for every selected key.
 Downloads disable redirects and environment proxy inheritance, remain under the
 configured CDN root, enforce declared size, and decrypt the bundle prefix while
 streaming. A worker checks UnityFS block CRC when nonzero. CRI's catalog CRC=0 is
-not claimed as a successful checksum comparison. Local embedded dependencies require an explicit immutable, hash-pinned directory
-source. Full length/SHA256 verification precedes decryption and CRC checking.
-Preflight reports availability and capability before attempting an export.
+not claimed as a successful checksum comparison. Only HTTP(S) resources are
+fetched. One dependency planner drives preflight and
+execution, retaining remote inputs and recording omitted package dependencies.
+Actual object and texture resolution remains mandatory in preview conversion.
+Font keys/aliases are retained as references plus available remote containers.
 
 CRI logical assets with exactly one raw-media dependency can bypass playback-only
 ScriptableObject/MonoScript dependencies. The selected raw container is still
@@ -54,8 +56,10 @@ HTTP exposes only SQL-indexed files. Startup removes unindexed publication
 directories and unfinished temporary files, retaining successful exports. A task
 may partially succeed; a single resource never advertises partial files.
 
-Raw bundles, CRI containers, decoded WAV and demuxed video are not retained as
-managed cache entries. Changing the format profile requires downloading again.
+Preview tasks discard downloaded containers, decoded WAV and demuxed video.
+Archive tasks explicitly retain downloaded CRI bytes or decrypted Unity bundles
+as indexed artifacts. Preview tasks do not yet reuse these container archives
+as a download cache, so changing the format profile downloads inputs again.
 Catalog binaries/metadata are retained for reproducibility. Output SHA256 is
 recorded after conversion. SHA256 is not used to claim authenticity of publisher
 content without an independent trusted expected digest.

@@ -2,6 +2,7 @@ use crate::{
     catalog::{CRYPT, Catalog, Location, Selector},
     config::Config,
     crypto, diagnostics,
+    plan::{self, Plan},
     shared::{self, Registry},
     task_runner,
     worker::{self, Artifact, Input, Job},
@@ -107,6 +108,11 @@ pub struct ExportRequest {
     pub archive: bool,
 }
 #[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceArchiveRequest {
+    pub snapshot: Option<String>,
+}
+#[derive(Default, Deserialize)]
 pub struct ListQuery {
     pub snapshot: Option<String>,
     pub prefix: Option<String>,
@@ -143,7 +149,7 @@ fn export_id(
             config.decryption(key),
             crypto::digest(&config.cri_key.to_le_bytes()),
             config.ffmpeg_threads,
-            config.local_source.as_ref().map(|s| s.identity()),
+            plan::POLICY,
         ))
         .unwrap(),
     )
@@ -702,6 +708,37 @@ impl App {
         });
         Ok(answer)
     }
+    /// Archive every directly addressable HTTP resource in one snapshot. Logical
+    /// preview types and local-only package records do not affect this selection.
+    pub async fn archive_resources(
+        self: &Arc<Self>,
+        request: ResourceArchiveRequest,
+    ) -> Result<Task> {
+        let (snapshot, catalog) = self.snapshot(request.snapshot.as_deref()).await?;
+        let mut keys = Vec::new();
+        for location in catalog
+            .locations
+            .values()
+            .filter(|l| l.options.is_some() && plan::remote(l))
+        {
+            ensure!(
+                catalog
+                    .keys
+                    .get(&location.key)
+                    .is_some_and(|ids| ids.as_slice() == [location.id]),
+                "HTTP resource primary key is missing or ambiguous"
+            );
+            keys.push(location.key.clone());
+        }
+        self.submit_export(ExportRequest {
+            snapshot: Some(snapshot.id),
+            keys,
+            prefix: None,
+            selector: Selector::default(),
+            archive: true,
+        })
+        .await
+    }
     async fn export_shared(
         self: &Arc<Self>,
         snapshot: Snapshot,
@@ -748,20 +785,7 @@ impl App {
             let opts=location.options.as_ref().context("missing bundle options")?;ensure!(opts.size>0&&opts.size<=app.config.input_bytes,"input size budget");
             let reservation=app.budget.reserve(opts.size)?;ensure!(fs2::available_space(&app.config.data_dir)?>opts.size,"insufficient free disk space");let dir=tempfile::Builder::new().prefix("download-").tempdir_in(app.config.data_dir.join("tmp"))?;
             let name=location.internal.rsplit('/').next().context("basename")?;ensure!(!name.is_empty(),"empty basename");let path=dir.path().join("payload");
-            if !location.internal.starts_with("http://") && !location.internal.starts_with("https://") {
-                let source=app.config.local_source.clone().context("local dependency requires configured source")?;
-                let internal=location.internal.clone();let target=path.clone();let limit=app.config.input_bytes;
-                let sha=tokio::task::spawn_blocking(move ||source.copy_verified(&internal,&target,limit)).await??;
-                ensure!(path.metadata()?.len()==opts.size,"local/catalog size mismatch");
-                if location.provider==CRYPT&&!crypto::builtin(name){
-                    use tokio::io::{AsyncReadExt,AsyncSeekExt};
-                    let mut file=tokio::fs::OpenOptions::new().read(true).write(true).open(&path).await?;
-                    let mut prefix=vec![0;opts.size.min(16384) as usize];file.read_exact(&mut prefix).await?;
-                    crypto::decrypt(&mut prefix,name,0)?;file.seek(std::io::SeekFrom::Start(0)).await?;file.write_all(&prefix).await?;file.sync_all().await?;
-                }
-                ensure!(!cancel.is_cancelled(),"cancelled");
-                return Ok(Download{input:Input{location,path},raw_sha256:sha,_dir:dir,_reservation:reservation});
-            }
+            ensure!(plan::remote(&location),"non-HTTP resource fetch forbidden");
             let config=Config{cdn_root:snapshot.cdn_root,..app.config.clone()};let url=config.asset_url(&location.internal)?;
             let response=tokio::select!{_ = cancel.cancelled()=>bail!("cancelled"),r=app.client.get(url).send()=>r?};ensure!(response.status()==StatusCode::OK,"CDN HTTP {}",response.status());ensure!(response.content_length().is_none_or(|n|n==opts.size),"Content-Length mismatch");
             use sha2::Digest;let mut hash=sha2::Sha256::new();let mut stream=response.bytes_stream();let mut f=tokio::fs::File::create(&path).await?;let mut received=0u64;
@@ -795,27 +819,10 @@ impl App {
             return Ok(m);
         }
         let (selector, archive) = selection;
-        let mut target = catalog.resolve(&key, &selector)?.clone();
-        target.key = key.clone();
-        let mut closure = catalog.closure_from(target.id)?;
-        // Playback wrapper dependencies are not required for the unique raw CRI payload.
-        if target.resource_type.starts_with("CriWare.") && !archive {
-            closure.retain(|l| l.provider == crate::catalog::CRI);
-            ensure!(closure.len() <= 1, "ambiguous CRI media dependencies");
-            if closure.is_empty() {
-                closure = catalog.closure_from(target.id)?;
-                // Serialized embedded CRI implementations carry their bytes in
-                // the target bundle's type tree; MonoScript playback assemblies
-                // are not used to read that byte array.
-                closure.retain(|l| {
-                    !l.internal
-                        .rsplit('/')
-                        .next()
-                        .is_some_and(|n| n.to_ascii_lowercase().contains("monoscripts"))
-                });
-            }
-        }
-        ensure!(closure.len() <= 512, "dependency count limit");
+        let plan = Plan::build(&catalog, &key, &selector, archive)?;
+        plan.validate()?;
+        let target = plan.target.clone();
+        let closure = plan.dependencies.clone();
         // Retain shared payload references until this resource finishes.
         let mut inputs = futures_util::stream::iter(closure)
             .map(|l| self.download(snapshot.clone(), l, &cancel))
@@ -859,7 +866,14 @@ impl App {
             target,
             inputs: inputs.iter().map(|v| v.input.clone()).collect(),
             output: output.clone(),
-            archive,
+            archive: plan.archive,
+            font_reference: if plan.font {
+                Some(
+                    json!({"key":key,"resource_type":plan.target.resource_type,"selected_location":plan.target.id,"disposition":plan.disposition(),"policy":plan::POLICY,"http_dependencies":plan.dependencies,"package_dependencies":plan.omitted_local,"conversion":"retained without font conversion","package_payload_downloaded":false}),
+                )
+            } else {
+                None
+            },
         };
         tokio::fs::write(&job_path, serde_json::to_vec(&job)?).await?;
         let exe = std::env::current_exe()?;
@@ -992,7 +1006,7 @@ impl App {
             files,
             selected_location: Some(job.target.id),
             empty: r.empty,
-            options:json!({"selector":selector,"archive":archive,"decryption":self.config.decryption(&job.target.key),"ffmpeg_threads":self.config.ffmpeg_threads,"media_identity":self.media_identity.get(),"local_source_identity":self.config.local_source.as_ref().map(|s|s.identity())}),
+            options:json!({"selector":selector,"archive":plan.archive,"requested_archive":archive,"disposition":plan.disposition(),"dependency_policy":plan::POLICY,"omitted_local_dependencies":plan.omitted_local,"dependency_closure_complete":plan.omitted_local.is_empty(),"decryption":self.config.decryption(&job.target.key),"ffmpeg_threads":self.config.ffmpeg_threads,"media_identity":self.media_identity.get()}),
             sources:inputs.iter().map(|i|json!({"internal_id":i.input.location.internal,"provider":i.input.location.provider,"options":i.input.location.options,"download_sha256":i.raw_sha256})).collect(),
         };
         tokio::fs::write(
@@ -1071,6 +1085,8 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/v1/assets", get(assets))
         .route("/v1/exports", post(exports))
         .route("/v1/preflight", post(preflight))
+        .route("/v1/resources", get(resources))
+        .route("/v1/resources/archive", post(archive_resources))
         .route("/v1/exports/{id}", get(manifest))
         .route("/v1/tasks/{id}", get(task))
         .route("/v1/tasks/{id}/cancel", post(cancel))
@@ -1245,6 +1261,39 @@ async fn file(
     Ok(response)
 }
 
+async fn resources(
+    State(app): State<Arc<App>>,
+    Query(query): Query<ListQuery>,
+) -> std::result::Result<Json<Value>, ApiError> {
+    let (snapshot, catalog) = app.snapshot(query.snapshot.as_deref()).await?;
+    let resources: Vec<_> = catalog
+        .locations
+        .values()
+        .filter(|l| l.options.is_some() && plan::remote(l))
+        .filter(|l| query.prefix.as_ref().is_none_or(|p| l.key.starts_with(p)))
+        .filter(|l| {
+            query
+                .resource_type
+                .as_ref()
+                .is_none_or(|t| t == &l.resource_type)
+        })
+        .collect();
+    let offset = query.offset.unwrap_or(0);
+    let limit = query.limit.unwrap_or(100).clamp(1, 1000);
+    let rows:Vec<_>=resources.iter().skip(offset).take(limit).map(|l|json!({"key":l.key,"location_id":l.id,"internal_id":l.internal,"provider":l.provider,"options":l.options})).collect();
+    Ok(Json(
+        json!({"snapshot":snapshot.id,"total":resources.len(),"offset":offset,"items":rows,"dependency_policy":plan::POLICY}),
+    ))
+}
+async fn archive_resources(
+    State(app): State<Arc<App>>,
+    Json(request): Json<ResourceArchiveRequest>,
+) -> std::result::Result<impl IntoResponse, ApiError> {
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(app.archive_resources(request).await?),
+    ))
+}
 async fn preflight(
     State(app): State<Arc<App>>,
     Json(request): Json<ExportRequest>,
@@ -1291,83 +1340,23 @@ async fn ensure_preflight(app: &App, request: ExportRequest) -> Result<Value> {
             .filter_map(|id| catalog.locations.get(id))
             .map(|l| json!({"location_id":l.id,"resource_type":l.resource_type}))
             .collect();
-        let target = match catalog.resolve(&key, &request.selector) {
-            Ok(v) => v,
-            Err(e) => {
-                results.push(json!({"key":key,"status":if candidates.len()>1{"ambiguous"}else{"missing"},"error":e.to_string(),"candidates":candidates}));
+        let plan = match Plan::build(&catalog, &key, &request.selector, request.archive) {
+            Ok(plan) => plan,
+            Err(error) => {
+                results.push(json!({"key":key,"status":if candidates.len()>1{"ambiguous"}else{"missing"},"error":error.to_string(),"candidates":candidates}));
                 continue;
             }
         };
-        let mut closure = match catalog.closure_from(target.id) {
-            Ok(v) => v,
-            Err(e) => {
-                results.push(json!({"key":key,"status":"missing","error":e.to_string()}));
-                continue;
-            }
-        };
-        let mut embedded_cri = false;
-        if target.resource_type.starts_with("CriWare.") && !request.archive {
-            let raw: Vec<_> = closure
-                .iter()
-                .filter(|l| l.provider == crate::catalog::CRI)
-                .cloned()
-                .collect();
-            if raw.is_empty() {
-                embedded_cri = true;
-                closure.retain(|l| {
-                    !l.internal
-                        .rsplit('/')
-                        .next()
-                        .is_some_and(|n| n.to_ascii_lowercase().contains("monoscripts"))
-                });
-            } else {
-                closure = raw;
-            }
-        }
-        let mut dependencies = vec![];
-        let mut missing = false;
-        let mut local = false;
-        for l in &closure {
-            let remote = l.internal.starts_with("https://") || l.internal.starts_with("http://");
-            let status = if remote {
-                "remote"
-            } else {
-                local = true;
-                if app.config.local_source.as_ref().is_some_and(|s| {
-                    s.open(&l.internal)
-                        .is_ok_and(|(_, e)| l.options.as_ref().is_some_and(|o| o.size == e.bytes))
-                }) {
-                    "local"
-                } else {
-                    missing = true;
-                    "missing"
-                }
-            };
-            dependencies.push(json!({"location_id":l.id,"internal_id":l.internal,"status":status}));
-        }
-        let supported = request.archive
-            || matches!(
-                target.resource_type.as_str(),
-                "UnityEngine.Texture2D"
-                    | "UnityEngine.Sprite"
-                    | "UnityEngine.TextAsset"
-                    | "UnityEngine.U2D.SpriteAtlas"
-            )
-            || target.resource_type.starts_with("CriWare.")
-            || target.provider == crate::catalog::CRI;
-        let cri = target.resource_type.starts_with("CriWare.") && !request.archive;
-        let status = if cri && !embedded_cri && closure.len() > 1 {
-            "ambiguous"
-        } else if missing || closure.is_empty() {
-            "missing"
-        } else if !supported {
+        let status = if plan.font {
+            "retained"
+        } else if !plan.supported {
             "unsupported"
-        } else if local {
-            "local"
+        } else if plan.dependencies.is_empty() {
+            "unavailable_http"
         } else {
             "remote"
         };
-        results.push(json!({"key":key,"status":status,"location_id":target.id,"resource_type":target.resource_type,"dependencies":dependencies,"candidates":candidates,"payload":if embedded_cri{"embedded_cri_candidate"}else{"raw"},"error":if cri&&closure.is_empty(){Some("missing_cri_payload")}else if cri&&!embedded_cri&&closure.len()>1{Some("ambiguous_cri_payload")}else{None}}));
+        results.push(json!({"key":key,"status":status,"location_id":plan.target.id,"resource_type":plan.target.resource_type,"dependencies":plan.dependencies.iter().map(|l|json!({"location_id":l.id,"internal_id":l.internal,"status":"remote"})).collect::<Vec<_>>(),"omitted_local_dependencies":plan.omitted_local,"candidates":candidates,"disposition":plan.disposition(),"payload":if plan.embedded_cri{"embedded_cri_candidate"}else{"raw"},"dependency_policy":plan::POLICY,"error":plan.validate().err().map(|e|e.to_string())}));
     }
     Ok(
         json!({"snapshot":snapshot.id,"profile":worker::PROFILE,"validation":"dependency availability only; payload hashes and codec validity are checked during export","results":results}),

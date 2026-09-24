@@ -4,7 +4,7 @@ A Rust HTTP service for retrieving and exporting Our Notes assets. It reads an
 Android Addressables catalog, downloads the selected dependencies, decrypts
 supported resources, and publishes usable files on local disk.
 
-Version **0.1.0-alpha.2**. This is an independent interoperability project, not an
+Version **0.1.0-alpha.3**. This is an independent interoperability project, not an
 official game service. The HTTP v1 and Rust interfaces are experimental.
 
 ## Supported Resources
@@ -17,7 +17,8 @@ official game service. The HTTP v1 and Rust interfaces are experimental.
 | USM MPEG/VP9, including separate alpha | H.264/AAC MP4 + lossless gray FFV1 mask when present |
 | Embedded serialized ACB | AAC-LC M4A, selected by exact wrapper reference |
 | Empty SpriteAtlas | Empty manifest, no fabricated image |
-| Explicit Unity archive mode | CRC-validated Unity bundles |
+| HTTP container archive | CRC-validated Unity bundles or original CRI containers |
+| Font assets and their subresources | Remote bundle + catalog reference, without font conversion |
 
 Unity parsing uses `unity-rs-core 0.5.1`; ACB/HCA parsing uses `cridecoder 0.3.5`.
 USM uses the bounded in-project demuxer; see [media contracts](docs/MEDIA.md).
@@ -26,15 +27,16 @@ plugin, game login, or player credentials are required at runtime.**
 
 Exports are asynchronous. Single-resource results publish atomically; batches
 may partially succeed. Concurrent requests share work, completed exports are
-reused, and GET requests never start downloads. Raw downloads and intermediate
-files are temporary, not a permanent asset cache. Catalog snapshots and old
+reused, and GET requests never start downloads. Downloads and intermediate files are temporary during preview conversion.
+Explicit archive tasks publish retained HTTP containers. Catalog snapshots and old
 exported versions remain available after a refresh.
 
 Not supported: arbitrary game versions/platforms, external streaming AWB banks,
 CPK, scene/model/animation exports, complex cue playback, song-segment assembly,
-multichannel audio and ambiguous multi-track video. Local dependencies require an
-explicit hash-pinned source from the matching game version; missing or mismatched
-files fail. Ambiguous keys require a type/location selector. Asset availability and rights remain the publisher's concern.
+multichannel audio and ambiguous multi-track video. Resource retrieval uses HTTP(S) only. Package-only dependencies are listed in
+preflight/manifests and never opened or guessed as CDN paths. Missing actual
+image/object references still fail during conversion. Ambiguous keys require a
+type/location selector. Asset availability and rights remain the publisher's concern.
 
 ## Install
 
@@ -82,6 +84,21 @@ an `export_id`; its manifest lists file IDs, labels, MIME types, sizes, and SHA2
 digests. File URLs support Range, HEAD, and ETag. Original asset names are labels,
 not trusted filesystem paths.
 
+To retain every directly downloadable resource in the catalog, independent of
+preview support:
+
+```sh
+curl 'http://127.0.0.1:8091/v1/resources?limit=100'
+curl -X POST http://127.0.0.1:8091/v1/resources/archive \
+  -H 'Content-Type: application/json' -d '{}'
+```
+
+This returns a normal task for all HTTP resource locations. Unity containers are
+decrypted and CRC-checked; CRI containers are preserved without transcoding.
+Fonts stay outside preview conversion: remote font bundles are archived, while
+package-only font keys produce a reference JSON clearly stating that the font
+bytes were not downloaded. Existing locally saved font data can remain offline.
+
 ## Storage and Limits
 
 The configured `data_dir` contains SQLite, retained catalog snapshots, immutable
@@ -120,17 +137,19 @@ cross-version encoding result.
 
 ## Preflight and readable files
 
-`POST /v1/preflight` accepts the export selection and reports remote/local/missing,
-ambiguous or unsupported dependencies without downloading. `selector` accepts
+`POST /v1/preflight` accepts the export selection and reports remote, retained
+font, unavailable-HTTP, missing, ambiguous or unsupported resources without
+downloading. It uses exactly the same dependency plan as execution. `selector` accepts
 `expected_type` or `location_id`; a location ID requires a single key. Use
-`archive: true` only for a validated Unity-container archive.
+`archive: true` to retain available HTTP containers. Archives record any omitted
+package dependencies and never claim a complete runtime package.
 
 ```sh
 moenotes-assets export-tree DATA_DIR DESTINATION SNAPSHOT_ID copy
 moenotes-assets upload-tree DESTINATION s3.toml
 ```
 
-See [export contracts](docs/EXPORT.md) for naming, local sources, conditional S3
+See [export contracts](docs/EXPORT.md) for naming, HTTP sources, conditional S3
 creation, credentials and immutable migration rules. Upload is an explicit CLI
 operation and is never triggered by a service request.
 
@@ -156,7 +175,7 @@ requirements before publishing it; see [Third-Party Notices](THIRD_PARTY_NOTICES
 ## API and Development
 
 See [HTTP API](docs/API.md), [media](docs/MEDIA.md),
-[local/tree/S3 export](docs/EXPORT.md), [development rules](docs/DEVELOPMENT.md),
+[HTTP/tree/S3 export](docs/EXPORT.md), [development rules](docs/DEVELOPMENT.md),
 [architecture](docs/ARCHITECTURE.md), and
 [changelog](CHANGELOG.md). Internal worker JSON is not a public integration API.
 

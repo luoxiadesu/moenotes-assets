@@ -4,7 +4,7 @@ pub mod config;
 pub mod crypto;
 mod diagnostics;
 mod embedded;
-pub mod local;
+pub mod plan;
 pub mod service;
 mod shared;
 mod task_runner;

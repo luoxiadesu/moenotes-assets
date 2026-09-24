@@ -29,7 +29,6 @@ pub struct Config {
     pub ffmpeg: String,
     pub ffprobe: String,
     pub cri_key: u64,
-    pub local_source: Option<crate::local::Source>,
     pub usm_decryption: crate::usm::Decryption,
     /// Exact logical-key overrides; no heuristic fallback after decode failure.
     pub usm_decryption_overrides: std::collections::BTreeMap<String, crate::usm::Decryption>,
@@ -67,7 +66,6 @@ impl Default for Config {
             ffmpeg: "ffmpeg".into(),
             ffprobe: "ffprobe".into(),
             cri_key: 8_594_927_479,
-            local_source: None,
             usm_decryption: Default::default(),
             usm_decryption_overrides: Default::default(),
             worker_cpu_seconds: None,
@@ -173,9 +171,6 @@ impl Config {
                     .all(|k| k.len() <= 4096),
             "decryption override limit"
         );
-        if let Some(source) = &self.local_source {
-            source.validate()?;
-        }
         self.root()?;
         Ok(())
     }

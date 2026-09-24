@@ -30,6 +30,7 @@ fn synthetic_worker_export_and_crc() {
         target,
         inputs: vec![Input { location, path }],
         archive: false,
+        font_reference: None,
         output: dir.path().join("out"),
     };
     let files = moenotes_assets::worker::run(&job).unwrap();
@@ -81,6 +82,7 @@ fn dependency_completion_order_does_not_change_export_ids() {
         target,
         inputs,
         archive: false,
+        font_reference: None,
         output: dir.path().join("first"),
     };
     let first = moenotes_assets::worker::run(&job).unwrap();
@@ -138,6 +140,7 @@ fn worker_crc_and_configuration_limits_fail_closed() {
         target: c.target(KEY).unwrap().clone(),
         inputs: vec![Input { location, path: p }],
         archive: false,
+        font_reference: None,
         output: dir.path().join("out"),
     };
     assert!(
@@ -194,6 +197,7 @@ fn generated_encrypted_hca_to_aac_and_wrong_key() {
         target: location.clone(),
         inputs: vec![Input { location, path }],
         archive: false,
+        font_reference: None,
         output: dir.path().join("out"),
     };
     // Exercise the real executable: its worker creates media-exec child processes.
@@ -331,6 +335,7 @@ fn explicit_location_type_and_archive_contracts() {
         }],
         output: d.path().join("out"),
         archive: true,
+        font_reference: None,
     };
     let files = moenotes_assets::worker::run(&job).unwrap();
     assert_eq!(files.len(), 1);
@@ -459,6 +464,7 @@ fn synthetic_usm_timing_alpha_pixels_and_missing_frames() {
             }],
             output: d.path().join(format!("out-{i}")),
             archive: false,
+            font_reference: None,
         };
         let request = d.path().join("job.json");
         std::fs::write(&request, serde_json::to_vec(&job).unwrap()).unwrap();
@@ -508,4 +514,42 @@ fn synthetic_usm_timing_alpha_pixels_and_missing_frames() {
             "lossless alpha pixels must match every source frame"
         );
     }
+}
+
+#[test]
+fn cri_archive_retains_container_bytes_without_conversion() {
+    let dir = tempfile::tempdir().unwrap();
+    let raw = b"CRIDsynthetic-raw-container";
+    let path = dir.path().join("input");
+    std::fs::write(&path, raw).unwrap();
+    let location = moenotes_assets::catalog::Location {
+        id: 1,
+        key: "video".into(),
+        internal: "https://cdn.invalid/asset/Android/raw".into(),
+        provider: moenotes_assets::catalog::CRI.into(),
+        resource_type: "container".into(),
+        dependencies: vec![],
+        options: None,
+    };
+    let job = Job {
+        config: Config {
+            cdn_root: "https://cdn.invalid".into(),
+            ..Default::default()
+        },
+        target: location.clone(),
+        inputs: vec![Input { location, path }],
+        output: dir.path().join("output"),
+        archive: true,
+        font_reference: None,
+    };
+    let files = moenotes_assets::worker::run(&job).unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(std::fs::read(job.output.join(&files[0].name)).unwrap(), raw);
+    assert_eq!(files[0].metadata["role"], "cri-container");
+    assert!(
+        files[0].metadata["validation"]
+            .as_str()
+            .unwrap()
+            .contains("no codec conversion")
+    );
 }

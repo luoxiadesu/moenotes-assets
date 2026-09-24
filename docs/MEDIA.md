@@ -1,10 +1,11 @@
-# Media profile v2
+# Media profile v3
 
-`json-png-aac-h264-mask-v2` replaces the v1 transformation profile. New export IDs
+`json-png-aac-h264-mask-http-v3` uses HTTP-only dependency planning. Media
+conversion parameters remain those of v2. New export IDs
 include the profile, catalog snapshot, exact key/selector, archive mode, chosen
 USM decryption mode, a digest of the configured CRI key, FFmpeg thread count,
-tool-version identity and pinned local-source identities. Old IDs and manifests
-remain accessible. Re-submit requests to build v2; there is no in-place migration.
+tool-version identity and the HTTP dependency policy. Old IDs and manifests
+remain accessible. Re-submit requests to build v3; there is no in-place migration.
 Changing an executable without changing its reported version is outside this
 identity guarantee. Service configuration and binaries must remain fixed while
 running.
@@ -77,5 +78,9 @@ An atlas is `empty` only when packed sprites, packed names and render data are
 all empty. Its manifest has `empty: true` and zero files; unresolved render data
 is an error. Unsupported Unity types are not converted to models or animation.
 Use explicit `archive: true` to publish CRC-validated Unity bundles and their
-bundle dependencies as `application/vnd.unity`; this is a container archive,
+available HTTP bundle dependencies as `application/vnd.unity`; this is a container archive,
 not a preview or a decoded model.
+
+Font data/subresources do not enter preview conversion; see EXPORT.md. Package
+references remain in their retention JSON even when no font bytes are remotely
+available. Explicit archive also supports unchanged CRI container bytes.
